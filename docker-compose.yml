@@ -1,0 +1,113 @@
+services:
+  workload-a:
+    build: ./services/workload
+    environment:
+      - CLOUD_ID=a
+      - BASE_LATENCY_MS=80
+      - JITTER_MS=30
+      - ERROR_RATE=0.01
+      - PAYLOAD_KB=32
+    ports:
+      - "8001:8000"
+
+  workload-b:
+    build: ./services/workload
+    environment:
+      - CLOUD_ID=b
+      - BASE_LATENCY_MS=120
+      - JITTER_MS=40
+      - ERROR_RATE=0.005
+      - PAYLOAD_KB=64
+    ports:
+      - "8002:8000"
+
+  router:
+    build: ./services/router
+    environment:
+      - TARGET_A_URL=http://workload-a:8000
+      - TARGET_B_URL=http://workload-b:8000
+      - ROUTER_ADMIN_TOKEN=${ROUTER_ADMIN_TOKEN:-changeme}
+      - CB_FAIL_THRESHOLD=5
+      - CB_OPEN_SECONDS=20
+      - SHADOW_PERCENT=0.05
+      - STICKY_HEADER=X-Sticky-Key
+    ports:
+      - "8080:8000"
+    depends_on:
+      - workload-a
+      - workload-b
+
+  pricefeed:
+    build: ./services/pricefeed
+    environment:
+      - COMPUTE_A_USD_PER_HOUR=0.010
+      - COMPUTE_B_USD_PER_HOUR=0.008
+      - EGRESS_A_USD_PER_GB=0.090
+      - EGRESS_B_USD_PER_GB=0.085
+    ports:
+      - "7070:8000"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - router
+      - workload-a
+      - workload-b
+      - pricefeed
+      - bot
+
+  grafana:
+    image: grafana/grafana:11.1.4
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_ADMIN_PASSWORD:-admin}
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+  bot:
+    build: ./services/bot
+    environment:
+      - PROM_URL=http://prometheus:9090
+      - ROUTER_URL=http://router:8000
+      - ROUTER_ADMIN_TOKEN=${ROUTER_ADMIN_TOKEN:-changeme}
+      - PRICEFEED_URL=http://pricefeed:8000
+
+      - DECISION_INTERVAL_SECONDS=15
+      - COOLDOWN_SECONDS=60
+      - WINDOW=2m
+
+      - MAX_P95_MS=200
+      - MAX_ERROR_RATE=0.02
+      - MIN_TOTAL_RPS=2
+
+      - MIN_SAVINGS_PER_HOUR=0.001
+      - SWITCHING_PENALTY_USD=0.0002
+
+      - RAMP_STEPS=0.10,0.25,0.50,1.00
+      - RAMP_STEP_MIN_SECONDS=45
+      - REQUIRED_GOOD_WINDOWS=3
+      - REQUIRED_BAD_WINDOWS=2
+
+      - EG_COST_MODE=project_full_traffic
+      - DB_PATH=/data/bot.db
+      - BOT_METRICS_PORT=9101
+    volumes:
+      - botdata:/data
+    ports:
+      - "9101:9101"
+    depends_on:
+      - router
+      - pricefeed
+
+volumes:
+  botdata:

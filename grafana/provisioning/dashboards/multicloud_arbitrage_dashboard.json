@@ -1,0 +1,383 @@
+{
+"annotations": {
+"list": [
+{
+"builtIn": 1,
+"datasource": {
+"type": "grafana",
+"uid": "-- Grafana --"
+},
+"enable": true,
+"hide": true,
+"iconColor": "rgba(0, 211, 255, 1)",
+"name": "Annotations & Alerts",
+"type": "dashboard"
+}
+]
+},
+"editable": true,
+"fiscalYearStartMonth": 0,
+"graphTooltip": 0,
+"id": null,
+"links": [],
+"panels": [
+{
+"datasource": {
+"type": "prometheus",
+"uid": "Prometheus"
+},
+"fieldConfig": {
+"defaults": {
+"unit": "reqps"
+},
+"overrides": []
+},
+"gridPos": {
+"h": 8,
+"w": 8,
+"x": 0,
+"y": 0
+},
+"id": 1,
+"options": {
+"legend": {
+"displayMode": "table",
+"placement": "bottom",
+"showLegend": true
+}
+},
+"targets": [
+{
+"expr": "sum(rate(router_backend_requests_total{kind="primary"}[2m])) by (backend)",
+"legendFormat": "backend={{backend}}",
+"refId": "A"
+}
+],
+"title": "Primary RPS by backend",
+"type": "timeseries"
+},
+{
+"datasource": {
+"type": "prometheus",
+"uid": "Prometheus"
+},
+"fieldConfig": {
+"defaults": {
+"unit": "s"
+},
+"overrides": []
+},
+"gridPos": {
+"h": 8,
+"w": 8,
+"x": 8,
+"y": 0
+},
+"id": 2,
+"options": {
+"legend": {
+"displayMode": "table",
+"placement": "bottom",
+"showLegend": true
+}
+},
+"targets": [
+{
+"expr": "histogram_quantile(0.95, sum(rate(router_backend_latency_seconds_bucket{kind="primary"}[2m])) by (le, backend))",
+"legendFormat": "p95 {{backend}}",
+"refId": "A"
+}
+],
+"title": "Router→Backend p95 latency (primary)",
+"type": "timeseries"
+},
+{
+"datasource": {
+"type": "prometheus",
+"uid": "Prometheus"
+},
+"fieldConfig": {
+"defaults": {
+"unit": "percentunit",
+"min": 0
+},
+"overrides": []
+},
+"gridPos": {
+"h": 8,
+"w": 8,
+"x": 16,
+"y": 0
+},
+"id": 3,
+"options": {
+"legend": {
+"displayMode": "table",
+"placement": "bottom",
+"showLegend": true
+}
+},
+"targets": [
+{
+"expr": "sum(rate(router_backend_requests_total{kind="primary",code_class="5xx"}[2m])) by (backend) / sum(rate(router_backend_requests_total{kind="primary"}[2m])) by (backend)",
+"legendFormat": "5xx rate {{backend}}",
+"refId": "A"
+}
+],
+"title": "5xx error rate (primary)",
+"type": "timeseries"
+},
+{
+"datasource": {
+"type": "prometheus",
+"uid": "Prometheus"
+},
+"fieldConfig": {
+"defaults": {
+"unit": "bytes"
+},
+"overrides": []
+},
+"gridPos": {
+"h": 8,
+"w": 8,
+"x": 0,
+"y": 8
+},
+"id": 4,
+"options": {
+"legend": {
+"displayMode": "table",
+"placement": "bottom",
+"showLegend": true
+}
+},
+"targets": [
+{
+"expr": "sum(rate(router_backend_response_bytes_total{kind="primary"}[2m])) by (backend)",
+"legendFormat": "bytes/s {{backend}}",
+"refId": "A"
+}
+],
+"title": "Response bytes/sec (primary) by backend",
+"type": "timeseries"
+},
+{
+"datasource": {
+"type": "prometheus",
+"uid": "Prometheus"
+},
+"fieldConfig": {
+"defaults": {
+"unit": "currencyUSD"
+},
+"overrides": []
+},
+"gridPos": {
+"h": 8,
+"w": 8,
+"x": 8,
+"y": 8
+},
+"id": 5,
+"options": {
+"legend": {
+"displayMode": "table",
+"placement": "bottom",
+"showLegend": true
+}
+},
+"targets": [
+{
+"expr": "price_compute_usd_per_hour",
+"legendFormat": "compute $/hr {{backend}}",
+"refId": "A"
+},
+{
+"expr": "price_egress_usd_per_gb",
+"legendFormat": "egress $/GB {{backend}}",
+"refId": "B"
+}
+],
+"title": "Price feed (compute + egress)",
+"type": "timeseries"
+},
+{
+"datasource": {
+"type": "prometheus",
+"uid": "Prometheus"
+},
+"fieldConfig": {
+"defaults": {
+"unit": "currencyUSD"
+},
+"overrides": []
+},
+"gridPos": {
+"h": 8,
+"w": 8,
+"x": 16,
+"y": 8
+},
+"id": 6,
+"options": {
+"legend": {
+"displayMode": "table",
+"placement": "bottom",
+"showLegend": true
+}
+},
+"targets": [
+{
+"expr": "sum(rate(router_backend_response_bytes_total{kind="primary"}[2m])) * 3600 / 1024 / 1024 / 1024 * price_egress_usd_per_gb{backend="a"}",
+"legendFormat": "Projected egress $/hr if 100% on a",
+"refId": "A"
+},
+{
+"expr": "sum(rate(router_backend_response_bytes_total{kind="primary"}[2m])) * 3600 / 1024 / 1024 / 1024 * price_egress_usd_per_gb{backend="b"}",
+"legendFormat": "Projected egress $/hr if 100% on b",
+"refId": "B"
+}
+],
+"title": "Projected egress $/hr (full traffic)",
+"type": "timeseries"
+},
+{
+"datasource": {
+"type": "prometheus",
+"uid": "Prometheus"
+},
+"fieldConfig": {
+"defaults": {
+"unit": "none"
+},
+"overrides": []
+},
+"gridPos": {
+"h": 8,
+"w": 8,
+"x": 0,
+"y": 16
+},
+"id": 7,
+"options": {
+"legend": {
+"displayMode": "table",
+"placement": "bottom",
+"showLegend": true
+}
+},
+"targets": [
+{
+"expr": "router_weight",
+"legendFormat": "weight {{backend}}",
+"refId": "A"
+}
+],
+"title": "Router weights",
+"type": "timeseries"
+},
+{
+"datasource": {
+"type": "prometheus",
+"uid": "Prometheus"
+},
+"fieldConfig": {
+"defaults": {
+"unit": "none",
+"min": 0,
+"max": 1
+},
+"overrides": []
+},
+"gridPos": {
+"h": 8,
+"w": 8,
+"x": 8,
+"y": 16
+},
+"id": 8,
+"options": {
+"legend": {
+"displayMode": "table",
+"placement": "bottom",
+"showLegend": true
+}
+},
+"targets": [
+{
+"expr": "router_circuit_open",
+"legendFormat": "cb_open {{backend}}",
+"refId": "A"
+}
+],
+"title": "Circuit breaker open",
+"type": "timeseries"
+},
+{
+"datasource": {
+"type": "prometheus",
+"uid": "Prometheus"
+},
+"fieldConfig": {
+"defaults": {
+"unit": "none"
+},
+"overrides": []
+},
+"gridPos": {
+"h": 8,
+"w": 8,
+"x": 16,
+"y": 16
+},
+"id": 9,
+"options": {
+"legend": {
+"displayMode": "table",
+"placement": "bottom",
+"showLegend": true
+}
+},
+"targets": [
+{
+"expr": "bot_phase",
+"legendFormat": "phase",
+"refId": "A"
+},
+{
+"expr": "bot_good_windows",
+"legendFormat": "good_windows",
+"refId": "B"
+},
+{
+"expr": "bot_bad_windows",
+"legendFormat": "bad_windows",
+"refId": "C"
+}
+],
+"title": "Bot state",
+"type": "timeseries"
+}
+],
+"refresh": "5s",
+"schemaVersion": 39,
+"style": "dark",
+"tags": [
+"multicloud",
+"arbitrage"
+],
+"templating": {
+"list": []
+},
+"time": {
+"from": "now-15m",
+"to": "now"
+},
+"timepicker": {},
+"timezone": "",
+"title": "Multi-Cloud Arbitrage (Cost + SLO)",
+"uid": "multicloud-arbitrage",
+"version": 1,
+"weekStart": ""
+}
