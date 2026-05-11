@@ -102,6 +102,13 @@ _live_state: dict = {
 }
 _force_override: Optional[str] = None
 
+_loadgen_lock = threading.Lock()
+_loadgen_state: dict = {
+    "running": False, "sent": 0, "ok": 0, "err": 0,
+    "rps": 0.0, "started": 0.0, "duration": 0,
+}
+_loadgen_thread: Optional[threading.Thread] = None
+
 # --- Phase 1C: alert rate-limiting ---
 _last_cost_alert_ts: float = 0.0
 
@@ -545,6 +552,27 @@ a{color:var(--accent);text-decoration:none}
 .toast.ok{background:var(--green-dim);color:var(--green);border:1px solid rgba(34,197,94,.3)}
 .toast.err{background:var(--red-dim);color:var(--red);border:1px solid rgba(244,63,94,.3)}
 
+/* ── Load Generator ── */
+.loadgen-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:24px 26px;margin-bottom:22px}
+.loadgen-body{display:flex;flex-wrap:wrap;align-items:flex-end;gap:18px}
+.lg-field{display:flex;flex-direction:column;gap:6px;min-width:130px}
+.lg-field label{font-size:.68rem;text-transform:uppercase;letter-spacing:.7px;color:var(--text-muted);font-weight:600}
+.lg-field input,.lg-field select{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-xs);color:var(--text);font-family:var(--font);font-size:.85rem;padding:9px 12px;width:100%;outline:none;transition:border-color .2s}
+.lg-field input:focus,.lg-field select:focus{border-color:var(--accent)}
+.lg-counter{display:flex;gap:20px;flex-wrap:wrap;align-items:center;padding:14px 16px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);margin-top:14px;min-height:54px}
+.lg-stat{display:flex;flex-direction:column;align-items:center;gap:2px;min-width:64px}
+.lg-stat-val{font-size:1.15rem;font-weight:800;color:var(--text);font-family:var(--mono)}
+.lg-stat-val.ok{color:var(--green)}.lg-stat-val.err{color:var(--red)}.lg-stat-val.dim{color:var(--text-dim)}
+.lg-stat-lbl{font-size:.64rem;text-transform:uppercase;letter-spacing:.6px;color:var(--text-muted);font-weight:600}
+.lg-prog-wrap{flex:1;min-width:160px}
+.lg-prog-track{height:6px;background:var(--surface3);border-radius:3px;overflow:hidden;margin-top:4px}
+.lg-prog-fill{height:100%;background:var(--grad);border-radius:3px;transition:width .8s linear}
+.lg-idle{color:var(--text-muted);font-size:.82rem;font-style:italic}
+.btn-green{background:var(--green);color:#0a1a0a;border-color:transparent;box-shadow:0 4px 14px rgba(34,197,94,.3)}
+.btn-green:hover{filter:brightness(1.1)}
+.btn-stop{background:var(--red-dim);color:var(--red);border-color:var(--red);box-shadow:none}
+.btn-stop:hover{background:var(--red);color:#fff}
+
 /* ── History ── */
 .history-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;margin-bottom:28px}
 .history-head{display:flex;align-items:center;justify-content:space-between;padding:18px 22px;border-bottom:1px solid var(--border)}
@@ -655,6 +683,41 @@ tbody td{padding:10px 16px;color:var(--text-dim);white-space:nowrap;font-size:.7
       Hold
     </button>
     <div class="toast" id="forceToast"></div>
+  </div>
+</div>
+
+<div class="loadgen-card">
+  <div class="section-title" style="margin-bottom:14px">
+    <svg style="width:16px;height:16px;vertical-align:-2px;margin-right:6px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+    Traffic Load Generator
+  </div>
+  <div class="loadgen-body">
+    <div class="lg-field" style="min-width:110px">
+      <label>Rate (req/s)</label>
+      <input type="number" id="lgRps" value="2" min="0.5" max="20" step="0.5">
+    </div>
+    <div class="lg-field" style="min-width:150px">
+      <label>Duration</label>
+      <select id="lgDuration">
+        <option value="120">2 minutes</option>
+        <option value="300" selected>5 minutes</option>
+        <option value="600">10 minutes</option>
+        <option value="1800">30 minutes</option>
+        <option value="3600">1 hour</option>
+      </select>
+    </div>
+    <button class="btn btn-green" id="lgStartBtn" onclick="startLoadgen()">
+      <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+      Start Traffic
+    </button>
+    <button class="btn btn-stop" id="lgStopBtn" style="display:none" onclick="stopLoadgen()">
+      <svg viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+      Stop
+    </button>
+    <div class="toast" id="lgToast"></div>
+  </div>
+  <div class="lg-counter" id="lgCounter">
+    <span class="lg-idle">No traffic running &mdash; configure rate and click Start</span>
   </div>
 </div>
 
@@ -868,8 +931,66 @@ async function forceAction(action){
   setTimeout(()=>{toast.style.display='none';},4500);
 }
 
-fetchStatus();fetchHistory();
-setInterval(fetchStatus,3000);setInterval(fetchHistory,12000);
+async function startLoadgen(){
+  const rps=parseFloat(document.getElementById('lgRps').value)||2;
+  const duration=parseInt(document.getElementById('lgDuration').value)||300;
+  const toast=document.getElementById('lgToast');
+  try{
+    const r=await fetch('/loadgen/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rps,duration})});
+    const d=await r.json();
+    if(r.ok){
+      document.getElementById('lgStartBtn').style.display='none';
+      document.getElementById('lgStopBtn').style.display='';
+      toast.className='toast ok';toast.textContent='✓ Started: '+rps+' req/s for '+duration+'s';
+    } else {
+      toast.className='toast err';toast.textContent=d.status||'Error';
+    }
+    toast.style.display='inline-flex';setTimeout(()=>toast.style.display='none',4000);
+  }catch(e){toast.className='toast err';toast.textContent='Request failed';toast.style.display='inline-flex';}
+}
+
+async function stopLoadgen(){
+  await fetch('/loadgen/stop',{method:'POST'});
+  document.getElementById('lgStartBtn').style.display='';
+  document.getElementById('lgStopBtn').style.display='none';
+}
+
+async function fetchLoadgen(){
+  try{
+    const r=await fetch('/loadgen/status');const s=await r.json();
+    const el=document.getElementById('lgCounter');
+    if(!s.running&&s.sent===0){
+      el.innerHTML='<span class="lg-idle">No traffic running &mdash; configure rate and click Start</span>';
+      document.getElementById('lgStartBtn').style.display='';
+      document.getElementById('lgStopBtn').style.display='none';
+      return;
+    }
+    const pct=s.duration>0?Math.min(100,(s.elapsed/s.duration*100)).toFixed(1):0;
+    const status=s.running?'Running':'Done';
+    const statusCol=s.running?'dim':'ok';
+    el.innerHTML=`
+      <div class="lg-stat"><span class="lg-stat-val dim">${status}</span><span class="lg-stat-lbl">Status</span></div>
+      <div class="lg-stat"><span class="lg-stat-val">${s.sent}</span><span class="lg-stat-lbl">Sent</span></div>
+      <div class="lg-stat"><span class="lg-stat-val ok">${s.ok}</span><span class="lg-stat-lbl">OK</span></div>
+      <div class="lg-stat"><span class="lg-stat-val ${s.err>0?'err':'ok'}">${s.err}</span><span class="lg-stat-lbl">Errors</span></div>
+      <div class="lg-stat"><span class="lg-stat-val">${s.success_rate}%</span><span class="lg-stat-lbl">Success</span></div>
+      <div class="lg-stat"><span class="lg-stat-val dim">${s.rps}</span><span class="lg-stat-lbl">req/s</span></div>
+      <div class="lg-prog-wrap">
+        <div style="display:flex;justify-content:space-between;font-size:.72rem;color:var(--text-muted)">
+          <span>${s.elapsed}s elapsed</span>
+          <span>${s.remaining}s left</span>
+        </div>
+        <div class="lg-prog-track"><div class="lg-prog-fill" style="width:${pct}%"></div></div>
+      </div>`;
+    if(!s.running){
+      document.getElementById('lgStartBtn').style.display='';
+      document.getElementById('lgStopBtn').style.display='none';
+    }
+  }catch(e){}
+}
+
+fetchStatus();fetchHistory();fetchLoadgen();
+setInterval(fetchStatus,3000);setInterval(fetchHistory,12000);setInterval(fetchLoadgen,1500);
 </script>
 </body></html>"""
 
@@ -957,6 +1078,68 @@ def api_force():
             return jsonify({"status": "conflict", "pending": _force_override}), 409
         _force_override = action
     return jsonify({"status": "queued", "action": action, "note": "consumed on next decision tick"}), 202
+
+
+def _run_loadgen(rps: float, duration: int, router_url: str) -> None:
+    global _loadgen_state
+    interval = 1.0 / rps
+    end_time = time.time() + duration
+    while time.time() < end_time:
+        with _loadgen_lock:
+            if not _loadgen_state["running"]:
+                break
+        try:
+            r = requests.get(f"{router_url}/work", timeout=5)
+            ok = 200 <= r.status_code < 300
+        except Exception:
+            ok = False
+        with _loadgen_lock:
+            _loadgen_state["sent"] += 1
+            if ok:
+                _loadgen_state["ok"] += 1
+            else:
+                _loadgen_state["err"] += 1
+        time.sleep(max(0, interval - 0.01))
+    with _loadgen_lock:
+        _loadgen_state["running"] = False
+
+
+@_flask_app.post("/loadgen/start")
+def api_loadgen_start():
+    global _loadgen_thread, _loadgen_state
+    data = flask_request.get_json(force=True, silent=True) or {}
+    rps = max(0.5, min(20.0, float(data.get("rps", 2))))
+    duration = max(30, min(3600, int(data.get("duration", 300))))
+    with _loadgen_lock:
+        if _loadgen_state["running"]:
+            return jsonify({"status": "already_running"}), 409
+        _loadgen_state = {
+            "running": True, "sent": 0, "ok": 0, "err": 0,
+            "rps": rps, "started": time.time(), "duration": duration,
+        }
+    _loadgen_thread = threading.Thread(
+        target=_run_loadgen, args=(rps, duration, ROUTER_URL), daemon=True
+    )
+    _loadgen_thread.start()
+    return jsonify({"status": "started", "rps": rps, "duration": duration}), 202
+
+
+@_flask_app.post("/loadgen/stop")
+def api_loadgen_stop():
+    with _loadgen_lock:
+        _loadgen_state["running"] = False
+    return jsonify({"status": "stopped"}), 200
+
+
+@_flask_app.get("/loadgen/status")
+def api_loadgen_status():
+    with _loadgen_lock:
+        s = dict(_loadgen_state)
+    elapsed = time.time() - s["started"] if s["started"] else 0
+    s["elapsed"] = round(elapsed, 1)
+    s["remaining"] = round(max(0, s["duration"] - elapsed), 1) if s["running"] else 0
+    s["success_rate"] = round(s["ok"] / s["sent"] * 100, 1) if s["sent"] else 0
+    return jsonify(s)
 
 
 def _run_flask() -> None:
