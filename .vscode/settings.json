@@ -1,0 +1,7 @@
+{
+  "python.defaultInterpreterPath": "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+  "python.analysis.extraPaths": [
+    "services/shared"
+  ],
+  "python.envFile": "${workspaceFolder}/.env.local"
+}

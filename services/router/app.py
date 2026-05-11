@@ -36,7 +36,17 @@ FORCE_BACKEND: Optional[str] = None
 WEIGHTS: Dict[str, float] = {n: (1.0 if i == 0 else 0.0) for i, n in enumerate(_NAMES)}
 _cb: Dict[str, dict] = {n: {"fails": 0.0, "open_until": 0.0} for n in _NAMES}
 
-app = FastAPI(title="router-v3")
+app = FastAPI(
+    title="MultiCloud Traffic Router",
+    description=(
+        "Intelligent HTTP traffic router with **weighted canary distribution**, "
+        "per-backend **circuit breakers**, **sticky sessions**, and **shadow traffic** mirroring. "
+        "Supports N backends loaded from a shared registry (`backends.json`)."
+    ),
+    version="3.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
 
 REQS = Counter(
     "router_backend_requests_total",
@@ -167,6 +177,7 @@ def get_target():
         "weights": WEIGHTS,
         "backends": {k: v.url for k, v in BACKENDS.items()},
         "cb": _cb,
+        "shadow_percent": SHADOW_PERCENT,
     }
 
 
@@ -236,6 +247,99 @@ async def set_weights(payload: dict, x_admin_token: Optional[str] = Header(defau
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/ui", include_in_schema=False)
+def router_ui():
+    from fastapi.responses import HTMLResponse
+    html = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Router — MultiCloud Arbitrage</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#070a12;--surface:#0e1120;--surface2:#161a2c;--border:#252a42;--accent:#2563eb;--green:#22c55e;--amber:#f59e0b;--red:#f43f5e;--text:#f1f5f9;--text-dim:#94a3b8;--text-muted:#475569;--font:'Inter',sans-serif;--mono:'JetBrains Mono',monospace;--radius:14px;--radius-sm:9px}
+html{font-family:var(--font);background:var(--bg);color:var(--text)}body{padding:28px 32px;max-width:1100px;margin:0 auto}
+.header{display:flex;align-items:center;gap:14px;margin-bottom:28px}
+.logo{width:44px;height:44px;background:linear-gradient(135deg,#2563eb,#7c3aed);border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:22px;box-shadow:0 0 24px rgba(37,99,235,.35)}
+h1{font-size:1.25rem;font-weight:800;letter-spacing:-.4px;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.sub{font-size:.75rem;color:var(--text-muted);margin-top:3px}
+.pill{display:flex;align-items:center;gap:7px;background:var(--surface);border:1px solid var(--border);border-radius:999px;padding:6px 14px;font-size:.75rem;color:var(--text-dim);margin-left:auto}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 7px var(--green)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}.dot{animation:pulse 2s infinite}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-bottom:22px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px}
+.card-label{font-size:.68rem;text-transform:uppercase;letter-spacing:.7px;color:var(--text-muted);font-weight:600;margin-bottom:8px}
+.card-value{font-size:1.5rem;font-weight:800;letter-spacing:-.5px}
+.card-value.blue{color:#60a5fa}.card-value.green{color:var(--green)}.card-value.amber{color:var(--amber)}
+.section{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:22px;margin-bottom:22px}
+.section-title{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--text-muted);margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.section-title::before{content:'';display:block;width:3px;height:14px;background:linear-gradient(135deg,#2563eb,#7c3aed);border-radius:99px}
+table{width:100%;border-collapse:collapse;font-size:.8rem}
+th{padding:9px 14px;text-align:left;font-size:.65rem;text-transform:uppercase;letter-spacing:.6px;color:var(--text-muted);background:var(--surface2);border-bottom:1px solid var(--border);font-weight:700}
+td{padding:10px 14px;border-bottom:1px solid var(--border);color:var(--text-dim)}
+tr:last-child td{border-bottom:none}tr:hover td{background:var(--surface2)}
+.tag{display:inline-block;padding:3px 10px;border-radius:999px;font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+.tag-active{background:rgba(34,197,94,.12);color:var(--green);border:1px solid rgba(34,197,94,.3)}
+.tag-standby{background:var(--surface2);color:var(--text-muted);border:1px solid var(--border)}
+.tag-open{background:rgba(244,63,94,.12);color:var(--red);border:1px solid rgba(244,63,94,.3)}
+.wbar-track{background:var(--surface2);border-radius:999px;height:6px;overflow:hidden;width:120px;display:inline-block;vertical-align:middle;margin-left:8px}
+.wbar-fill{height:100%;border-radius:999px;background:linear-gradient(90deg,#2563eb,#7c3aed)}
+.footer{padding-top:16px;border-top:1px solid var(--border);font-size:.72rem;color:var(--text-muted);display:flex;justify-content:space-between}
+.links a{color:#60a5fa;margin-right:14px;text-decoration:none}
+</style></head>
+<body>
+<div class="header">
+  <div class="logo">&#128257;</div>
+  <div><h1>Traffic Router</h1><div class="sub">MultiCloud Arbitrage Bot &mdash; Router Service</div></div>
+  <div class="pill"><div class="dot"></div><span id="liveLabel">Connecting&hellip;</span></div>
+</div>
+<div class="cards">
+  <div class="card"><div class="card-label">Mode</div><div class="card-value blue" id="cMode">&mdash;</div></div>
+  <div class="card"><div class="card-label">Active Backend</div><div class="card-value green" id="cActive">&mdash;</div></div>
+  <div class="card"><div class="card-label">Shadow Traffic</div><div class="card-value amber" id="cShadow">&mdash;</div></div>
+</div>
+<div class="section">
+  <div class="section-title">Backend Status &amp; Weights</div>
+  <table><thead><tr><th>Backend</th><th>URL</th><th>Weight</th><th>Traffic Bar</th><th>Circuit Breaker</th><th>Status</th></tr></thead>
+  <tbody id="backendTable"></tbody></table>
+</div>
+<div class="footer">
+  <div class="links"><a href="/docs">Swagger UI</a><a href="/redoc">ReDoc</a><a href="/target">Raw JSON</a><a href="/metrics">Prometheus</a></div>
+  <span id="footerTs">Last update: &mdash;</span>
+</div>
+<script>
+async function refresh(){
+  try{
+    const r=await fetch('/target');const d=await r.json();
+    document.getElementById('cMode').textContent=(d.mode||'').toUpperCase();
+    const bk=Object.keys(d.weights||{});
+    const active=Object.entries(d.weights||{}).sort((a,b)=>b[1]-a[1])[0]?.[0]||'&mdash;';
+    document.getElementById('cActive').textContent=active.toUpperCase();
+    document.getElementById('cShadow').textContent=(d.shadow_percent*100).toFixed(1)+'% mirror';
+    document.getElementById('backendTable').innerHTML=bk.map(b=>{
+      const w=(d.weights[b]*100).toFixed(0);
+      const cb=d.cb[b]||{};
+      const cbOpen=Date.now()/1000<cb.open_until;
+      const isActive=b===active;
+      return `<tr>
+<td style="font-weight:700;color:#f1f5f9">${b.toUpperCase()}</td>
+<td style="font-family:'JetBrains Mono',monospace;font-size:.75rem">${d.backends[b]||'&mdash;'}</td>
+<td style="font-weight:700;font-family:'JetBrains Mono',monospace">${w}%</td>
+<td><div class="wbar-track"><div class="wbar-fill" style="width:${w}%"></div></div></td>
+<td><span class="tag ${cbOpen?'tag-open':'tag-standby'}">${cbOpen?'&#9889; Open':'Closed'}</span></td>
+<td><span class="tag ${isActive?'tag-active':'tag-standby'}">${isActive?'&#9679; Active':'&#9675; Standby'}</span></td>
+</tr>`;
+    }).join('');
+    document.getElementById('liveLabel').textContent='Live';
+    document.getElementById('footerTs').textContent='Last update: '+new Date().toLocaleTimeString();
+  }catch(e){document.getElementById('liveLabel').textContent='Error';}
+}
+refresh();setInterval(refresh,3000);
+</script>
+</body></html>"""
+    return HTMLResponse(content=html)
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])

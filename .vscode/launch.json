@@ -1,0 +1,143 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    // ── workload-a ────────────────────────────────────────────────────────────
+    {
+      "name": "workload-a (:8001)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["app:app", "--host", "0.0.0.0", "--port", "8001", "--reload"],
+      "cwd": "${workspaceFolder}/services/workload",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/services/shared",
+        "CLOUD_ID": "a",
+        "BASE_LATENCY_MS": "80",
+        "JITTER_MS": "30",
+        "ERROR_RATE": "0.01",
+        "PAYLOAD_KB": "32"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    // ── workload-b ────────────────────────────────────────────────────────────
+    {
+      "name": "workload-b (:8002)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["app:app", "--host", "0.0.0.0", "--port", "8002", "--reload"],
+      "cwd": "${workspaceFolder}/services/workload",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/services/shared",
+        "CLOUD_ID": "b",
+        "BASE_LATENCY_MS": "120",
+        "JITTER_MS": "40",
+        "ERROR_RATE": "0.005",
+        "PAYLOAD_KB": "64"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    // ── pricefeed ─────────────────────────────────────────────────────────────
+    {
+      "name": "pricefeed (:7070)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["app:app", "--host", "0.0.0.0", "--port", "7070", "--reload"],
+      "cwd": "${workspaceFolder}/services/pricefeed",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/services/shared",
+        "BACKENDS_CONFIG_PATH": "${workspaceFolder}/backends.local.json"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    // ── router ────────────────────────────────────────────────────────────────
+    {
+      "name": "router (:8080)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["app:app", "--host", "0.0.0.0", "--port", "8080", "--reload"],
+      "cwd": "${workspaceFolder}/services/router",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/services/shared",
+        "BACKENDS_CONFIG_PATH": "${workspaceFolder}/backends.local.json",
+        "ROUTER_ADMIN_TOKEN": "changeme",
+        "CB_FAIL_THRESHOLD": "5",
+        "CB_OPEN_SECONDS": "20",
+        "SHADOW_PERCENT": "0.05",
+        "STICKY_HEADER": "X-Sticky-Key"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    // ── bot ───────────────────────────────────────────────────────────────────
+    {
+      "name": "bot (metrics :9101, API :9102)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/services/bot/bot.py",
+      "cwd": "${workspaceFolder}/services/bot",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/services/shared",
+        "BACKENDS_CONFIG_PATH": "${workspaceFolder}/backends.local.json",
+        "PROM_URL": "http://localhost:9090",
+        "ROUTER_URL": "http://localhost:8080",
+        "ROUTER_ADMIN_TOKEN": "changeme",
+        "PRICEFEED_URL": "http://localhost:7070",
+        "DECISION_INTERVAL_SECONDS": "15",
+        "COOLDOWN_SECONDS": "60",
+        "WINDOW": "2m",
+        "MAX_P95_MS": "200",
+        "MAX_ERROR_RATE": "0.02",
+        "MIN_TOTAL_RPS": "2",
+        "MIN_SAVINGS_PER_HOUR": "0.001",
+        "SWITCHING_PENALTY_USD": "0.0002",
+        "RAMP_STEPS": "0.10,0.25,0.50,1.00",
+        "RAMP_STEP_MIN_SECONDS": "45",
+        "REQUIRED_GOOD_WINDOWS": "3",
+        "REQUIRED_BAD_WINDOWS": "2",
+        "EG_COST_MODE": "project_full_traffic",
+        "DB_PATH": "${workspaceFolder}/.local_bot.db",
+        "BOT_METRICS_PORT": "9101",
+        "POST_FAILOVER_HOLD_SECONDS": "300",
+        "POST_FAILOVER_CONFIRM_WINDOWS": "5",
+        "DRAIN_STEPS": "4",
+        "DRAIN_STEP_SECONDS": "10",
+        "ALERT_WEBHOOK_URL": "",
+        "ALERT_ON_FAILOVER": "true",
+        "ALERT_ON_ROLLBACK": "true",
+        "ALERT_ON_BAD_WINDOWS": "true",
+        "BOT_INSTANCE_NAME": "multicloud-bot-local",
+        "BOT_API_PORT": "9102",
+        "BOT_API_TOKEN": ""
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    // ── full stack (compound) ─────────────────────────────────────────────────
+    {
+      "name": "Full Stack",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_local.sh",
+      "console": "integratedTerminal"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "All Services",
+      "configurations": [
+        "workload-a (:8001)",
+        "workload-b (:8002)",
+        "pricefeed (:7070)",
+        "router (:8080)",
+        "bot (metrics :9101, API :9102)"
+      ],
+      "stopAll": true
+    }
+  ]
+}
