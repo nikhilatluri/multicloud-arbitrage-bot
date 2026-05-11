@@ -342,6 +342,11 @@ refresh();setInterval(refresh,3000);
     return HTMLResponse(content=html)
 
 
+@app.get("/metrics")
+def metrics():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy(path: str, request: Request):
     ROUTER_MODE.set(0 if MODE == "weighted" else 1)
@@ -392,8 +397,3 @@ async def proxy(path: str, request: Request):
     if ct:
         out_headers["content-type"] = ct
     return Response(content=resp.content, status_code=resp.status_code, headers=out_headers)
-
-
-@app.get("/metrics")
-def metrics():
-    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)

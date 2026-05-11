@@ -244,11 +244,14 @@ def p95_ms(backend: str) -> Optional[float]:
 
 
 def err_rate(backend: str) -> Optional[float]:
-    q = (
-        f'(sum(rate(router_backend_requests_total{{backend="{backend}",kind="primary",code_class="5xx"}}[{WINDOW}])) '
-        f'/ sum(rate(router_backend_requests_total{{backend="{backend}",kind="primary"}}[{WINDOW}])))'
-    )
-    return prom_query(q)
+    total_q = f'sum(rate(router_backend_requests_total{{backend="{backend}",kind="primary"}}[{WINDOW}]))'
+    total = prom_query(total_q)
+    if total is None or total == 0:
+        return None  # no traffic — can't compute a rate
+    err_q = f'sum(rate(router_backend_requests_total{{backend="{backend}",kind="primary",code_class="5xx"}}[{WINDOW}]))'
+    err = prom_query(err_q)
+    # absent 5xx series means zero errors, not unknown
+    return 0.0 if err is None else err / total
 
 
 def rps_primary(backend: str) -> Optional[float]:

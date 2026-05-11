@@ -42,6 +42,8 @@ fi
 # ── start ────────────────────────────────────────────────────────────────────
 mkdir -p "$LOGS_DIR"
 > "$PID_FILE"
+# Truncate logs so each run starts clean (no stale errors from old runs)
+for _log in "$LOGS_DIR"/*.log; do > "$_log" 2>/dev/null || true; done
 
 trap 'echo; echo "Shutting down..."; kill $(cat "$PID_FILE" 2>/dev/null) 2>/dev/null; rm -f "$PID_FILE"; echo "Done."; exit 0' INT TERM
 
@@ -119,6 +121,23 @@ echo "Starting router on :8080 ..."
 echo $! >> "$PID_FILE"
 wait_for_port router 8080
 
+# ── prometheus (must start before bot so bot can query it immediately) ────────
+PROM_BIN="$(which prometheus 2>/dev/null || ls /opt/homebrew/bin/prometheus 2>/dev/null || echo "")"
+if [[ -n "$PROM_BIN" ]]; then
+  echo "Starting prometheus on :9090 ..."
+  (
+    "$PROM_BIN" \
+      --config.file="$REPO/prometheus/prometheus.local.yml" \
+      --storage.tsdb.path="$REPO/.local_prometheus_data" \
+      --web.listen-address="0.0.0.0:9090" \
+      >> "$LOGS_DIR/prometheus.log" 2>&1
+  ) &
+  echo $! >> "$PID_FILE"
+  wait_for_port prometheus 9090
+else
+  echo "  (prometheus not found — skipping; bot will retry until Prometheus is available)"
+fi
+
 # ── bot ───────────────────────────────────────────────────────────────────────
 echo "Starting bot (metrics :9101, API :9102) ..."
 (
@@ -134,7 +153,7 @@ echo "Starting bot (metrics :9101, API :9102) ..."
   export WINDOW=2m
   export MAX_P95_MS=200
   export MAX_ERROR_RATE=0.02
-  export MIN_TOTAL_RPS=2
+  export MIN_TOTAL_RPS=0.5
   export MIN_SAVINGS_PER_HOUR=0.001
   export SWITCHING_PENALTY_USD=0.0002
   export RAMP_STEPS="0.10,0.25,0.50,1.00"
@@ -160,23 +179,6 @@ echo "Starting bot (metrics :9101, API :9102) ..."
 echo $! >> "$PID_FILE"
 wait_for_port bot-metrics 9101
 wait_for_port bot-api 9102
-
-# ── prometheus ────────────────────────────────────────────────────────────────
-PROM_BIN="$(which prometheus 2>/dev/null || ls /opt/homebrew/bin/prometheus 2>/dev/null || echo "")"
-if [[ -n "$PROM_BIN" ]]; then
-  echo "Starting prometheus on :9090 ..."
-  (
-    "$PROM_BIN" \
-      --config.file="$REPO/prometheus/prometheus.local.yml" \
-      --storage.tsdb.path="$REPO/.local_prometheus_data" \
-      --web.listen-address="0.0.0.0:9090" \
-      >> "$LOGS_DIR/prometheus.log" 2>&1
-  ) &
-  echo $! >> "$PID_FILE"
-  wait_for_port prometheus 9090
-else
-  echo "  (prometheus not found — skipping)"
-fi
 
 # ── grafana ───────────────────────────────────────────────────────────────────
 GRAFANA_BIN="$(which grafana-server 2>/dev/null || ls /opt/homebrew/bin/grafana 2>/dev/null || echo "")"
