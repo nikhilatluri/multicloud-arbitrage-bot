@@ -1,0 +1,14 @@
+{
+  "backends": {
+    "a": {
+      "url": "http://workload-a:8000",
+      "compute_usd_per_hour": 0.010,
+      "egress_usd_per_gb": 0.090
+    },
+    "b": {
+      "url": "http://workload-b:8000",
+      "compute_usd_per_hour": 0.008,
+      "egress_usd_per_gb": 0.085
+    }
+  }
+}

@@ -1,16 +1,27 @@
 import os
 import sqlite3
+import sys
+import threading
 import time
 import json
 from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Tuple
 
 import requests
+from flask import Flask, jsonify, request as flask_request
 from prometheus_client import Gauge, Counter, start_http_server
 
-Backend = Literal["a", "b"]
-Phase = Literal["steady", "ramping"]
+# Add shared config to path — tries Docker layout (/app/shared) then local dev (../shared)
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+for _p in [os.path.join(_this_dir, "shared"), os.path.join(_this_dir, "..", "shared")]:
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
+        break
+from config import BackendConfig, load_backends, backend_names as _config_backend_names  # noqa: E402
 
+Phase = Literal["steady", "ramping", "post_failover_hold", "draining"]
+
+# --- Core config ---
 PROM_URL = os.getenv("PROM_URL", "http://localhost:9090")
 ROUTER_URL = os.getenv("ROUTER_URL", "http://localhost:8080")
 ADMIN_TOKEN = os.getenv("ROUTER_ADMIN_TOKEN", "changeme")
@@ -25,6 +36,7 @@ MAX_ERROR_RATE = float(os.getenv("MAX_ERROR_RATE", "0.02"))
 MIN_TOTAL_RPS = float(os.getenv("MIN_TOTAL_RPS", "1"))
 
 MIN_SAVINGS_PER_HOUR = float(os.getenv("MIN_SAVINGS_PER_HOUR", "0.001"))
+# Phase 0 fix: SWITCHING_PENALTY_USD is a one-time gate at ramp start, not a per-cycle tax
 SWITCHING_PENALTY_USD = float(os.getenv("SWITCHING_PENALTY_USD", "0.0"))
 
 RAMP_STEPS = [float(x.strip()) for x in os.getenv("RAMP_STEPS", "0.10,0.25,0.50,1.00").split(",")]
@@ -32,17 +44,67 @@ RAMP_STEP_MIN_SECONDS = int(os.getenv("RAMP_STEP_MIN_SECONDS", "45"))
 REQUIRED_GOOD_WINDOWS = int(os.getenv("REQUIRED_GOOD_WINDOWS", "3"))
 REQUIRED_BAD_WINDOWS = int(os.getenv("REQUIRED_BAD_WINDOWS", "2"))
 
-EG_COST_MODE = os.getenv("EG_COST_MODE", "project_full_traffic")  # project_full_traffic | use_observed_split
+EG_COST_MODE = os.getenv("EG_COST_MODE", "project_full_traffic")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 BOT_METRICS_PORT = int(os.getenv("BOT_METRICS_PORT", "9101"))
 
-# --- Bot metrics ---
-M_PHASE = Gauge("bot_phase", "Bot phase (0 steady, 1 ramping)")
+# --- Phase 1A: hysteresis after failover ---
+POST_FAILOVER_HOLD_SECONDS = int(os.getenv("POST_FAILOVER_HOLD_SECONDS", "300"))
+POST_FAILOVER_CONFIRM_WINDOWS_NEEDED = int(os.getenv("POST_FAILOVER_CONFIRM_WINDOWS", "5"))
+
+# --- Phase 1B: graceful drain ---
+DRAIN_STEPS_COUNT = int(os.getenv("DRAIN_STEPS", "4"))
+DRAIN_STEP_SECONDS = int(os.getenv("DRAIN_STEP_SECONDS", "10"))
+
+# --- Phase 1C: alert integration ---
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "")
+ALERT_ON_FAILOVER = os.getenv("ALERT_ON_FAILOVER", "true").lower() == "true"
+ALERT_ON_ROLLBACK = os.getenv("ALERT_ON_ROLLBACK", "true").lower() == "true"
+ALERT_ON_BAD_WINDOWS = os.getenv("ALERT_ON_BAD_WINDOWS", "true").lower() == "true"
+_ALERT_COST_STR = os.getenv("ALERT_COST_THRESHOLD_USD_PER_HOUR", "")
+ALERT_COST_THRESHOLD: Optional[float] = float(_ALERT_COST_STR) if _ALERT_COST_STR else None
+ALERT_RETRY_COUNT = int(os.getenv("ALERT_RETRY_COUNT", "3"))
+ALERT_RETRY_BACKOFF = float(os.getenv("ALERT_RETRY_BACKOFF_SECONDS", "2"))
+ALERT_TIMEOUT = float(os.getenv("ALERT_TIMEOUT_SECONDS", "5"))
+BOT_INSTANCE_NAME = os.getenv("BOT_INSTANCE_NAME", "multicloud-bot")
+
+# --- Phase 1D: REST API ---
+BOT_API_PORT = int(os.getenv("BOT_API_PORT", "9102"))
+BOT_API_TOKEN = os.getenv("BOT_API_TOKEN", "")
+
+# --- Load N-backend registry ---
+BACKENDS: Dict[str, BackendConfig] = load_backends()
+BNAMES: List[str] = sorted(BACKENDS.keys())  # stable sorted order
+
+# --- Prometheus metrics ---
+M_PHASE = Gauge("bot_phase", "Bot phase (0=steady,1=ramping,2=post_failover_hold,3=draining)")
 M_GOOD = Gauge("bot_good_windows", "Consecutive good windows")
 M_BAD = Gauge("bot_bad_windows", "Consecutive bad windows")
 M_ACTIONS = Counter("bot_actions_total", "Bot actions", ["action"])
 M_EST_COST = Gauge("bot_estimated_total_cost_usd_per_hour", "Estimated total $/hr", ["backend"])
 M_EST_EGRESS = Gauge("bot_estimated_egress_cost_usd_per_hour", "Estimated egress $/hr", ["backend"])
+# Phase 1A metrics
+M_FAILOVER_HOLD = Gauge("bot_post_failover_hold_remaining_seconds", "Seconds remaining in post-failover hold")
+M_FAILOVER_CONFIRM = Gauge("bot_post_failover_confirm_windows", "Consecutive good shadow windows after failover")
+# Phase 3B: cost anomaly
+M_COST_ANOMALY = Gauge("bot_cost_anomaly", "1 if any backend cost exceeds threshold, else 0")
+
+# --- Phase 1D: shared state ---
+_state_lock = threading.Lock()
+_live_state: dict = {
+    "ts": "", "phase": "steady", "active": BNAMES[0] if BNAMES else "a",
+    "candidate": BNAMES[-1] if len(BNAMES) > 1 else "b",
+    "step_index": 0, "weights": {n: (1.0 if i == 0 else 0.0) for i, n in enumerate(BNAMES)},
+    "good_windows": 0, "bad_windows": 0, "last_change": 0.0,
+    "last_action": "none", "last_reason": "n/a",
+    "slo": {}, "cost_usd_per_hour": {}, "egress_usd_per_hour": {},
+    "ramp_info": {}, "last_failover_ts": 0.0, "post_failover_confirm_windows": 0,
+}
+_force_override: Optional[str] = None
+
+# --- Phase 1C: alert rate-limiting ---
+_last_cost_alert_ts: float = 0.0
+
 
 @dataclass
 class Slo:
@@ -60,38 +122,104 @@ class Slo:
             and self.err <= MAX_ERROR_RATE
         )
 
+
+# ---------------------------------------------------------------------------
+# SQLite helpers with N-backend schema migration
+# ---------------------------------------------------------------------------
+
 def _db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA journal_mode=WAL")
     con.execute("""CREATE TABLE IF NOT EXISTS state(
         k TEXT PRIMARY KEY,
         v TEXT
     )""")
-    con.execute("""CREATE TABLE IF NOT EXISTS decisions(
-        ts TEXT,
-        phase TEXT,
-        active TEXT,
-        candidate TEXT,
-        step_index INTEGER,
-        weights_a REAL, weights_b REAL,
-        compute_a REAL, compute_b REAL,
-        egress_a REAL, egress_b REAL,
-        p95_a REAL, p95_b REAL,
-        err_a REAL, err_b REAL,
-        cb_a REAL, cb_b REAL,
-        rps_a REAL, rps_b REAL,
-        bytesps_a REAL, bytesps_b REAL,
-        action TEXT,
-        reason TEXT
-    )""")
+
+    # Phase 2D: detect old fixed-column schema and migrate to JSON-blob columns
+    cols = {row[1] for row in con.execute("PRAGMA table_info(decisions)").fetchall()}
+    if not cols:
+        # Fresh DB — create with JSON-blob schema
+        con.execute("""CREATE TABLE decisions(
+            ts TEXT,
+            phase TEXT,
+            active TEXT,
+            candidate TEXT,
+            step_index INTEGER,
+            weights_json TEXT,
+            compute_json TEXT,
+            egress_json TEXT,
+            p95_json TEXT,
+            err_json TEXT,
+            cb_json TEXT,
+            rps_json TEXT,
+            bytesps_json TEXT,
+            action TEXT,
+            reason TEXT
+        )""")
+    elif "weights_a" in cols and "weights_json" not in cols:
+        # Old fixed-column schema — rename and add JSON columns
+        con.execute("ALTER TABLE decisions RENAME TO decisions_legacy")
+        con.execute("""CREATE TABLE decisions(
+            ts TEXT,
+            phase TEXT,
+            active TEXT,
+            candidate TEXT,
+            step_index INTEGER,
+            weights_json TEXT,
+            compute_json TEXT,
+            egress_json TEXT,
+            p95_json TEXT,
+            err_json TEXT,
+            cb_json TEXT,
+            rps_json TEXT,
+            bytesps_json TEXT,
+            action TEXT,
+            reason TEXT
+        )""")
+        # Migrate existing rows (converts fixed a/b columns to JSON blobs)
+        old_rows = con.execute(
+            "SELECT ts,phase,active,candidate,step_index,"
+            "weights_a,weights_b,compute_a,compute_b,egress_a,egress_b,"
+            "p95_a,p95_b,err_a,err_b,cb_a,cb_b,rps_a,rps_b,bytesps_a,bytesps_b,"
+            "action,reason FROM decisions_legacy"
+        ).fetchall()
+        for row in old_rows:
+            (ts, ph, act, cnd, si,
+             wa, wb, ca, cb, ea, eb,
+             p95a, p95b, erra, errb, cba, cbb, rpsa, rpsb, bpa, bpb,
+             ac, rs) = row
+            con.execute(
+                "INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    ts, ph, act, cnd, si,
+                    json.dumps({"a": wa, "b": wb}),
+                    json.dumps({"a": ca, "b": cb}),
+                    json.dumps({"a": ea, "b": eb}),
+                    json.dumps({"a": p95a, "b": p95b}),
+                    json.dumps({"a": erra, "b": errb}),
+                    json.dumps({"a": cba, "b": cbb}),
+                    json.dumps({"a": rpsa, "b": rpsb}),
+                    json.dumps({"a": bpa, "b": bpb}),
+                    ac, rs,
+                ),
+            )
+    con.commit()
     return con
+
 
 def _get_state(con: sqlite3.Connection, k: str, default: str) -> str:
     row = con.execute("SELECT v FROM state WHERE k=?", (k,)).fetchone()
     return row[0] if row else default
 
+
 def _set_state(con: sqlite3.Connection, k: str, v: str) -> None:
     con.execute("INSERT INTO state(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
     con.commit()
+
+
+# ---------------------------------------------------------------------------
+# Prometheus query helpers (backend-agnostic strings)
+# ---------------------------------------------------------------------------
 
 def prom_query(q: str) -> Optional[float]:
     r = requests.get(f"{PROM_URL}/api/v1/query", params={"query": q}, timeout=5)
@@ -104,7 +232,8 @@ def prom_query(q: str) -> Optional[float]:
     except Exception:
         return None
 
-def p95_ms(backend: Backend) -> Optional[float]:
+
+def p95_ms(backend: str) -> Optional[float]:
     q = (
         f'histogram_quantile(0.95, '
         f'sum(rate(router_backend_latency_seconds_bucket{{backend="{backend}",kind="primary"}}[{WINDOW}])) by (le)'
@@ -113,234 +242,598 @@ def p95_ms(backend: Backend) -> Optional[float]:
     v = prom_query(q)
     return None if v is None else v * 1000.0
 
-def err_rate(backend: Backend) -> Optional[float]:
+
+def err_rate(backend: str) -> Optional[float]:
     q = (
         f'(sum(rate(router_backend_requests_total{{backend="{backend}",kind="primary",code_class="5xx"}}[{WINDOW}])) '
         f'/ sum(rate(router_backend_requests_total{{backend="{backend}",kind="primary"}}[{WINDOW}])))'
     )
     return prom_query(q)
 
-def rps_primary(backend: Backend) -> Optional[float]:
+
+def rps_primary(backend: str) -> Optional[float]:
     q = f'sum(rate(router_backend_requests_total{{backend="{backend}",kind="primary"}}[{WINDOW}]))'
     return prom_query(q)
 
-def bytes_per_s_primary(backend: Backend) -> Optional[float]:
+
+def bytes_per_s_primary(backend: str) -> Optional[float]:
     q = f'sum(rate(router_backend_response_bytes_total{{backend="{backend}",kind="primary"}}[{WINDOW}]))'
     return prom_query(q)
 
-def bytes_per_s_shadow(backend: Backend) -> Optional[float]:
+
+def bytes_per_s_shadow(backend: str) -> Optional[float]:
     q = f'sum(rate(router_backend_response_bytes_total{{backend="{backend}",kind="shadow"}}[{WINDOW}]))'
     return prom_query(q)
 
-def rps_shadow(backend: Backend) -> Optional[float]:
+
+def rps_shadow(backend: str) -> Optional[float]:
     q = f'sum(rate(router_backend_requests_total{{backend="{backend}",kind="shadow"}}[{WINDOW}]))'
     return prom_query(q)
 
-def cb_open(backend: Backend) -> Optional[float]:
+
+def cb_open(backend: str) -> Optional[float]:
     q = f'max(router_circuit_open{{backend="{backend}"}})'
     return prom_query(q)
 
-def get_slos() -> Dict[Backend, Slo]:
-    return {
-        "a": Slo(p95_ms("a"), err_rate("a"), cb_open("a"), rps_primary("a")),
-        "b": Slo(p95_ms("b"), err_rate("b"), cb_open("b"), rps_primary("b")),
-    }
 
-def get_prices() -> Tuple[Dict[Backend, float], Dict[Backend, float]]:
+def get_slos() -> Dict[str, Slo]:
+    return {b: Slo(p95_ms(b), err_rate(b), cb_open(b), rps_primary(b)) for b in BNAMES}
+
+
+def get_prices() -> Tuple[Dict[str, float], Dict[str, float]]:
     r = requests.get(f"{PRICEFEED_URL}/price", timeout=5)
     r.raise_for_status()
     j = r.json()
-    compute = {"a": float(j["compute_usd_per_hour"]["a"]), "b": float(j["compute_usd_per_hour"]["b"])}
-    egress = {"a": float(j["egress_usd_per_gb"]["a"]), "b": float(j["egress_usd_per_gb"]["b"])}
+    compute = {k: float(v) for k, v in j["compute_usd_per_hour"].items()}
+    egress = {k: float(v) for k, v in j["egress_usd_per_gb"].items()}
     return compute, egress
 
-def get_weights() -> Dict[Backend, float]:
+
+def get_weights() -> Dict[str, float]:
     r = requests.get(f"{ROUTER_URL}/target", timeout=5)
     r.raise_for_status()
-    w = r.json()["weights"]
-    return {"a": float(w["a"]), "b": float(w["b"])}
+    return {k: float(v) for k, v in r.json()["weights"].items()}
 
-def set_weights(wa: float, wb: float) -> None:
+
+def set_weights_dict(weights: Dict[str, float]) -> None:
+    """POST a full weights dict to the router."""
     r = requests.post(
         f"{ROUTER_URL}/admin/weights",
-        json={"a": wa, "b": wb},
+        json=weights,
         headers={"X-Admin-Token": ADMIN_TOKEN},
         timeout=5,
     )
     r.raise_for_status()
 
-def active_from_weights(w: Dict[Backend, float]) -> Backend:
-    return "a" if w["a"] >= w["b"] else "b"
 
-def other(b: Backend) -> Backend:
-    return "b" if b == "a" else "a"
+def build_weights(full: str, partial: str, step: float) -> Dict[str, float]:
+    """Build weights dict: `full` backend gets (1-step), `partial` gets step, others get 0."""
+    w = {b: 0.0 for b in BNAMES}
+    w[full] = 1.0 - step
+    w[partial] = step
+    return w
+
+
+def primary_from_weights(w: Dict[str, float]) -> str:
+    """Backend with the highest weight. Tie-break: alphabetically first backend."""
+    if not w:
+        return BNAMES[0]
+    best = max(BNAMES, key=lambda b: w.get(b, 0.0))
+    # Phase 0 fix: warn when weights are exactly tied
+    top_weight = w.get(best, 0.0)
+    tied = [b for b in BNAMES if abs(w.get(b, 0.0) - top_weight) < 1e-9]
+    if len(tied) > 1:
+        print(json.dumps({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "warning": "weights_tied",
+            "tied_backends": sorted(tied),
+            "message": f"weights are tied; picking '{best}' (alphabetically first) as active",
+        }), flush=True)
+    return best
+
+
+def candidates_ranked_by_cost(
+    active: str,
+    total_cost: Dict[str, Optional[float]],
+    slos: Dict[str, Slo],
+) -> List[str]:
+    """Return non-active backends sorted by total cost (cheapest first), healthy ones first."""
+    others = [b for b in BNAMES if b != active]
+    healthy = [b for b in others if slos[b].ok() and total_cost.get(b) is not None]
+    unhealthy = [b for b in others if b not in healthy]
+    healthy.sort(key=lambda b: total_cost[b])  # type: ignore[index]
+    return healthy + unhealthy
+
+
+def full_weights_on(backend: str) -> Dict[str, float]:
+    """100% traffic to one backend, 0 to all others."""
+    w = {b: 0.0 for b in BNAMES}
+    w[backend] = 1.0
+    return w
+
 
 def _gb(x_bytes: float) -> float:
     return x_bytes / 1024.0 / 1024.0 / 1024.0
 
-def estimate_full_traffic_bytes_per_s() -> float:
-    # total observed primary bytes/s across both backends ~= total traffic bytes/s
-    a = bytes_per_s_primary("a") or 0.0
-    b = bytes_per_s_primary("b") or 0.0
-    return a + b
 
-def estimate_bytes_per_req_for_backend(backend: Backend) -> Optional[float]:
-    # Prefer shadow sample for candidate quality; else fall back to primary
+def estimate_full_traffic_bytes_per_s() -> float:
+    return sum(bytes_per_s_primary(b) or 0.0 for b in BNAMES)
+
+
+def estimate_bytes_per_req_for_backend(backend: str) -> Optional[float]:
     srps = rps_shadow(backend)
     sbytes = bytes_per_s_shadow(backend)
     if srps is not None and sbytes is not None and srps > 0.2:
         return sbytes / srps
-
     prps = rps_primary(backend)
     pbytes = bytes_per_s_primary(backend)
     if prps is not None and pbytes is not None and prps > 0:
         return pbytes / prps
-
     return None
 
-def estimate_egress_cost_per_hour_if_100pct_on(backend: Backend, egress_usd_per_gb: Dict[Backend, float]) -> Optional[float]:
+
+def estimate_egress_cost_per_hour_if_100pct_on(backend: str, egress_usd_per_gb: Dict[str, float]) -> Optional[float]:
     total_bytes_s = estimate_full_traffic_bytes_per_s()
     bpr = estimate_bytes_per_req_for_backend(backend)
-    total_rps = (rps_primary("a") or 0.0) + (rps_primary("b") or 0.0)
+    total_rps = sum(rps_primary(b) or 0.0 for b in BNAMES)
 
     if EG_COST_MODE == "use_observed_split":
-        # just use what backend currently serves (under current weights)
         bps = bytes_per_s_primary(backend)
         if bps is None:
             return None
         return _gb(bps * 3600.0) * egress_usd_per_gb[backend]
 
-    # project_full_traffic: assume all traffic moves to target, but payload shape follows that backend's bytes/req
     if bpr is None:
-        # fallback: use current aggregate traffic bytes/s without shaping
         return _gb(total_bytes_s * 3600.0) * egress_usd_per_gb[backend]
-
     projected_bytes_s = total_rps * bpr
     return _gb(projected_bytes_s * 3600.0) * egress_usd_per_gb[backend]
 
+
+# ---------------------------------------------------------------------------
+# Phase 1C: alert integration
+# ---------------------------------------------------------------------------
+
+def _do_send_alert(payload: dict) -> None:
+    for attempt in range(ALERT_RETRY_COUNT):
+        try:
+            r = requests.post(ALERT_WEBHOOK_URL, json=payload, timeout=ALERT_TIMEOUT)
+            r.raise_for_status()
+            return
+        except Exception:
+            if attempt < ALERT_RETRY_COUNT - 1:
+                time.sleep(ALERT_RETRY_BACKOFF)
+    print(json.dumps({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "warning": "alert_send_failed",
+        "event": payload.get("event"),
+    }), flush=True)
+
+
+def send_alert(event: str, severity: str, payload_data: dict) -> None:
+    if not ALERT_WEBHOOK_URL:
+        return
+    payload = {
+        "event": event,
+        "severity": severity,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "bot_instance": BOT_INSTANCE_NAME,
+        "text": f"[{severity.upper()}] {BOT_INSTANCE_NAME}: {event}",
+        "payload": payload_data,
+    }
+    threading.Thread(target=_do_send_alert, args=(payload,), daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1D: Flask REST API
+# ---------------------------------------------------------------------------
+
+_flask_app = Flask("bot-api")
+
+
+@_flask_app.get("/status")
+def api_status():
+    with _state_lock:
+        snap = dict(_live_state)
+        snap["pending_force"] = _force_override
+    now = time.time()
+    if snap.get("last_change"):
+        snap["last_change_ago_seconds"] = round(now - snap["last_change"], 1)
+    if snap.get("phase") == "post_failover_hold" and snap.get("last_failover_ts"):
+        remaining = max(0.0, snap["last_failover_ts"] + POST_FAILOVER_HOLD_SECONDS - now)
+        snap["post_failover_hold_remaining_seconds"] = round(remaining, 1)
+    return jsonify(snap)
+
+
+@_flask_app.get("/history")
+def api_history():
+    limit = min(int(flask_request.args.get("limit", 50)), 500)
+    con2 = sqlite3.connect(DB_PATH, check_same_thread=False)
+    rows = con2.execute(
+        "SELECT ts,phase,active,candidate,step_index,"
+        "weights_json,compute_json,egress_json,p95_json,err_json,"
+        "cb_json,rps_json,bytesps_json,action,reason "
+        "FROM decisions ORDER BY ts DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    con2.close()
+    cols = [
+        "ts", "phase", "active", "candidate", "step_index",
+        "weights", "compute", "egress", "p95_ms", "err_rate",
+        "cb_open", "rps", "bytes_per_s", "action", "reason",
+    ]
+    def _parse(row):
+        d = {}
+        for i, col in enumerate(cols):
+            v = row[i]
+            # JSON blob columns (indices 5-12)
+            if 5 <= i <= 12:
+                try:
+                    v = json.loads(v) if v else {}
+                except Exception:
+                    pass
+            d[col] = v
+        return d
+    return jsonify({"rows": [_parse(r) for r in rows], "count": len(rows), "limit": limit})
+
+
+@_flask_app.post("/force")
+def api_force():
+    global _force_override
+    valid_actions = {"force_failover_to_" + b for b in BNAMES} | {"force_rollback", "force_hold"}
+    if BOT_API_TOKEN:
+        auth = flask_request.headers.get("Authorization", "")
+        if auth != f"Bearer {BOT_API_TOKEN}":
+            return jsonify({"status": "error", "detail": "unauthorized"}), 401
+    data = flask_request.get_json(force=True, silent=True) or {}
+    action = data.get("action", "")
+    if action not in valid_actions:
+        return jsonify({"status": "error", "detail": f"unknown action; valid: {sorted(valid_actions)}"}), 400
+    with _state_lock:
+        if _force_override is not None:
+            return jsonify({"status": "conflict", "pending": _force_override}), 409
+        _force_override = action
+    return jsonify({"status": "queued", "action": action, "note": "consumed on next decision tick"}), 202
+
+
+def _run_flask() -> None:
+    _flask_app.run(host="0.0.0.0", port=BOT_API_PORT, threaded=True, use_reloader=False)
+
+
+# ---------------------------------------------------------------------------
+# Main decision loop
+# ---------------------------------------------------------------------------
+
 def main():
+    global _force_override, _last_cost_alert_ts
+
     start_http_server(BOT_METRICS_PORT)
+    threading.Thread(target=_run_flask, daemon=True).start()
+
     con = _db()
 
-    phase: Phase = _get_state(con, "phase", "steady")  # type: ignore[assignment]
+    # Load persisted state
+    phase: str = _get_state(con, "phase", "steady")
     step_index = int(_get_state(con, "step_index", "0"))
-    ramp_candidate: Backend = _get_state(con, "ramp_candidate", "b")  # type: ignore[assignment]
+    ramp_candidate: str = _get_state(con, "ramp_candidate", BNAMES[-1] if len(BNAMES) > 1 else BNAMES[0])
     step_since = float(_get_state(con, "step_since", str(time.time())))
     last_change = float(_get_state(con, "last_change", "0"))
-
     good_windows = int(_get_state(con, "good_windows", "0"))
     bad_windows = int(_get_state(con, "bad_windows", "0"))
+
+    # Phase 1A state
+    last_failover_ts = float(_get_state(con, "last_failover_ts", "0"))
+    post_failover_confirm_windows = int(_get_state(con, "post_failover_confirm_windows", "0"))
+    failover_from: str = _get_state(con, "failover_from", BNAMES[0])
+
+    # Phase 1B state
+    drain_target: str = _get_state(con, "drain_target", BNAMES[0])
+    drain_current_step = int(_get_state(con, "drain_current_step", "0"))
+    drain_step_since = float(_get_state(con, "drain_step_since", "0"))
+    drain_initial_weight_loser = float(_get_state(con, "drain_initial_weight_loser", "0"))
+
+    startup_cb_checked = False
 
     while True:
         ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         action, reason = "none", "n/a"
 
+        # Defaults so audit log always has values even on early exception
+        active: str = BNAMES[0]
+        cand: str = BNAMES[-1] if len(BNAMES) > 1 else BNAMES[0]
+        w: Dict[str, float] = {b: (1.0 if i == 0 else 0.0) for i, b in enumerate(BNAMES)}
+        slos: Dict[str, Slo] = {}
+        compute: Dict[str, float] = {}
+        egress: Dict[str, float] = {}
+        total_cost: Dict[str, Optional[float]] = {}
+        eg_costs: Dict[str, Optional[float]] = {}
+
         try:
+            # Phase 1D: consume pending force override
+            with _state_lock:
+                force_cmd = _force_override
+                _force_override = None
+
             w = get_weights()
-            active = active_from_weights(w)
-            cand = other(active)
+            active = primary_from_weights(w)
 
             slos = get_slos()
             compute, egress = get_prices()
 
-            # egress + total cost model (per hour) for each target
-            eg_a = estimate_egress_cost_per_hour_if_100pct_on("a", egress)
-            eg_b = estimate_egress_cost_per_hour_if_100pct_on("b", egress)
-            if eg_a is not None:
-                M_EST_EGRESS.labels(backend="a").set(eg_a)
-            if eg_b is not None:
-                M_EST_EGRESS.labels(backend="b").set(eg_b)
+            # Phase 0: warn at startup if circuit breaker is already open
+            if not startup_cb_checked:
+                startup_cb_checked = True
+                for b in BNAMES:
+                    if slos[b].cb_open is not None and slos[b].cb_open >= 1.0:
+                        print(json.dumps({
+                            "ts": ts, "warning": "stale_cb_state", "backend": b,
+                            "message": "circuit breaker open at startup; state may be stale after router restart",
+                        }), flush=True)
 
-            total_cost = {}
-            for b in ("a", "b"):
-                eg = eg_a if b == "a" else eg_b
-                if eg is None:
-                    total_cost[b] = None
-                else:
-                    total_cost[b] = compute[b] + eg
+            # Egress + total cost per backend (N backends)
+            for b in BNAMES:
+                eg = estimate_egress_cost_per_hour_if_100pct_on(b, egress)
+                eg_costs[b] = eg
+                if eg is not None:
+                    M_EST_EGRESS.labels(backend=b).set(eg)
+                total_cost[b] = (compute[b] + eg) if eg is not None else None
+                if total_cost[b] is not None:
                     M_EST_COST.labels(backend=b).set(total_cost[b])
 
-            total_rps = (slos["a"].rps_primary or 0.0) + (slos["b"].rps_primary or 0.0)
-            if total_rps < MIN_TOTAL_RPS:
+            # Phase 1C: cost anomaly alert (rate-limited)
+            anomaly_detected = False
+            if ALERT_COST_THRESHOLD and total_cost.get(active) is not None:
+                if total_cost[active] > ALERT_COST_THRESHOLD:  # type: ignore[operator]
+                    anomaly_detected = True
+                    if time.time() - _last_cost_alert_ts > 3 * DECISION_INTERVAL:
+                        _last_cost_alert_ts = time.time()
+                        send_alert("cost_anomaly", "warning", {
+                            "backend": active,
+                            "projected_cost_usd_per_hour": total_cost[active],
+                            "threshold_usd_per_hour": ALERT_COST_THRESHOLD,
+                        })
+            M_COST_ANOMALY.set(1 if anomaly_detected else 0)
+
+            total_rps = sum(slos[b].rps_primary or 0.0 for b in BNAMES)
+
+            # Phase 2D: ranked candidates list (N backends)
+            ranked_cands = candidates_ranked_by_cost(active, total_cost, slos)
+            # best_cand is the cheapest healthy non-active backend
+            best_cand = ranked_cands[0] if ranked_cands else (BNAMES[-1] if len(BNAMES) > 1 else BNAMES[0])
+            cand = best_cand
+
+            # Phase 0 fix: base savings without penalty (for monitoring); penalty applied only at ramp-start
+            if total_cost.get(active) is not None and total_cost.get(cand) is not None:
+                base_savings: Optional[float] = float(total_cost[active]) - float(total_cost[cand])  # type: ignore[arg-type]
+            else:
+                base_savings = None
+
+            # --- Phase 1D: force overrides ---
+            if force_cmd:
+                cooldown_ok = (time.time() - last_change) >= COOLDOWN_SECONDS
+                if force_cmd.startswith("force_failover_to_"):
+                    target = force_cmd[len("force_failover_to_"):]
+                    if target in BNAMES:
+                        set_weights_dict(full_weights_on(target))
+                        phase, step_index = "steady", 0
+                        good_windows, bad_windows = 0, 0
+                        last_change = time.time()
+                        action, reason = force_cmd, "manual_override"
+                elif force_cmd == "force_rollback":
+                    if phase == "ramping":
+                        drain_loser = ramp_candidate
+                        drain_target = active
+                        drain_initial_weight_loser = float(w.get(drain_loser, 0.0))
+                        drain_current_step = 0
+                        drain_step_since = time.time()
+                        phase = "draining"
+                        last_change = time.time()
+                        good_windows, bad_windows = 0, 0
+                        action, reason = f"force_rollback_drain_started_to_{active}", "manual_override"
+                    else:
+                        reason = "force_rollback_no_active_ramp"
+                elif force_cmd == "force_hold":
+                    last_change = time.time()
+                    action, reason = "force_hold", "manual_hold"
+
+            elif total_rps < MIN_TOTAL_RPS:
                 reason = "hold_low_traffic"
+
             else:
                 cooldown_ok = (time.time() - last_change) >= COOLDOWN_SECONDS
 
-                # Savings if fully moved, including switching penalty (per hour)
-                if total_cost[active] is None or total_cost[cand] is None:
-                    savings_per_hour = None
-                else:
-                    savings_per_hour = float(total_cost[active] - total_cost[cand] - SWITCHING_PENALTY_USD)
+                # --- Phase 1A: post-failover hold ---
+                if phase == "post_failover_hold":
+                    recovering = failover_from
+                    slo_rec = slos.get(recovering)
+                    slo_rec_ok = (
+                        slo_rec is not None
+                        and slo_rec.p95_ms is not None and slo_rec.p95_ms <= MAX_P95_MS
+                        and slo_rec.err is not None and slo_rec.err <= MAX_ERROR_RATE
+                        and (slo_rec.cb_open is None or slo_rec.cb_open < 1.0)
+                    )
 
-                # Hard failover: active violates SLO and candidate ok
-                if cooldown_ok and (not slos[active].ok()) and slos[cand].ok():
-                    set_weights(0.0 if active == "a" else 1.0, 1.0 if active == "a" else 0.0)
-                    phase, step_index = "steady", 0
+                    if slo_rec_ok:
+                        post_failover_confirm_windows += 1
+                    else:
+                        post_failover_confirm_windows = 0
+
+                    hold_remaining = max(0.0, last_failover_ts + POST_FAILOVER_HOLD_SECONDS - time.time())
+                    M_FAILOVER_HOLD.set(hold_remaining)
+                    M_FAILOVER_CONFIRM.set(post_failover_confirm_windows)
+
+                    hold_elapsed = (time.time() - last_failover_ts) >= POST_FAILOVER_HOLD_SECONDS
+                    confirm_met = post_failover_confirm_windows >= POST_FAILOVER_CONFIRM_WINDOWS_NEEDED
+
+                    # Escape hatch: current active also degrades — allow re-failover
+                    if cooldown_ok and not slos[active].ok() and slo_rec_ok:
+                        set_weights_dict(full_weights_on(recovering))
+                        phase = "post_failover_hold"
+                        step_index = 0
+                        last_failover_ts = time.time()
+                        failover_from = active
+                        post_failover_confirm_windows = 0
+                        last_change = time.time()
+                        action, reason = f"failover_to_{recovering}", "double_failover_escape"
+                        if ALERT_ON_FAILOVER:
+                            send_alert("failover_triggered", "critical", {
+                                "from_backend": active, "to_backend": recovering,
+                                "reason": "double_failover_escape",
+                            })
+                    elif hold_elapsed and confirm_met:
+                        phase = "steady"
+                        post_failover_confirm_windows = 0
+                        M_FAILOVER_HOLD.set(0)
+                        action, reason = "post_failover_hold_released", "hold_and_confirm_complete"
+                    else:
+                        reason = "post_failover_hold"
+
+                # --- Phase 1B: graceful drain ---
+                elif phase == "draining":
+                    drain_loser = next((b for b in BNAMES if b != drain_target), BNAMES[0])
+
+                    if not slos[drain_target].ok():
+                        # Abort: drain target degraded, restore drain_loser
+                        set_weights_dict(full_weights_on(drain_loser))
+                        phase, step_index = "steady", 0
+                        good_windows, bad_windows = 0, 0
+                        last_change = time.time()
+                        action, reason = f"drain_aborted_to_{drain_loser}", "drain_target_degraded"
+                    elif (time.time() - drain_step_since) >= DRAIN_STEP_SECONDS:
+                        drain_current_step += 1
+                        drain_step_since = time.time()
+
+                        if drain_current_step >= DRAIN_STEPS_COUNT or drain_initial_weight_loser <= 0:
+                            set_weights_dict(full_weights_on(drain_target))
+                            phase, step_index = "steady", 0
+                            good_windows, bad_windows = 0, 0
+                            action, reason = f"drain_complete_to_{drain_target}", "drain_complete"
+                        else:
+                            loser_w = drain_initial_weight_loser * (1.0 - drain_current_step / DRAIN_STEPS_COUNT)
+                            winner_w = 1.0 - loser_w
+                            new_w = {b: 0.0 for b in BNAMES}
+                            new_w[drain_target] = winner_w
+                            new_w[drain_loser] = loser_w
+                            set_weights_dict(new_w)
+                            action, reason = f"drain_step_{drain_current_step}_{drain_target}", "draining"
+                    else:
+                        reason = "drain_waiting"
+
+                # --- Hard failover: active violates SLO, best_cand is healthy ---
+                elif cooldown_ok and not slos[active].ok() and slos.get(cand, Slo(None, None, None, None)).ok():
+                    set_weights_dict(full_weights_on(cand))
+                    phase = "post_failover_hold"
+                    step_index = 0
                     good_windows, bad_windows = 0, 0
+                    last_failover_ts = time.time()
+                    failover_from = active
+                    post_failover_confirm_windows = 0
                     last_change = time.time()
                     action, reason = f"failover_to_{cand}", "active_slo_violation"
+                    if ALERT_ON_FAILOVER:
+                        send_alert("failover_triggered", "critical", {
+                            "from_backend": active, "to_backend": cand,
+                            "reason": "active_slo_violation",
+                            "slo_active": {"p95_ms": slos[active].p95_ms, "err": slos[active].err,
+                                           "cb_open": slos[active].cb_open, "ok": False},
+                            "slo_candidate": {"p95_ms": slos[cand].p95_ms, "err": slos[cand].err,
+                                              "cb_open": slos[cand].cb_open, "ok": True},
+                        })
+
+                # --- Steady phase ---
+                elif phase == "steady":
+                    # Phase 0 fix: apply SWITCHING_PENALTY_USD only at ramp-start gate
+                    ramp_savings = (base_savings - SWITCHING_PENALTY_USD) if base_savings is not None else None
+                    if (cooldown_ok and slos.get(cand, Slo(None, None, None, None)).ok()
+                            and ramp_savings is not None and ramp_savings >= MIN_SAVINGS_PER_HOUR):
+                        ramp_candidate = cand
+                        step_index = 0
+                        step_since = time.time()
+                        good_windows, bad_windows = 0, 0
+                        phase = "ramping"
+                        last_change = time.time()
+
+                        step = RAMP_STEPS[step_index]
+                        set_weights_dict(build_weights(full=active, partial=cand, step=step))
+                        action, reason = f"start_ramp_{ramp_candidate}", "cost_opportunity"
+                    else:
+                        reason = "stay_steady"
+
+                # --- Ramping phase ---
                 else:
-                    if phase == "steady":
-                        if cooldown_ok and slos[cand].ok() and savings_per_hour is not None and savings_per_hour >= MIN_SAVINGS_PER_HOUR:
-                            ramp_candidate = cand
-                            step_index = 0
+                    cand = ramp_candidate  # locked-in ramp target
+                    act = primary_from_weights(w)
+
+                    # Phase 0 fix: use base_savings (no penalty) for ramp monitoring
+                    # Recompute savings against the locked ramp_candidate
+                    if total_cost.get(act) is not None and total_cost.get(cand) is not None:
+                        ramp_base_savings: Optional[float] = float(total_cost[act]) - float(total_cost[cand])  # type: ignore[arg-type]
+                    else:
+                        ramp_base_savings = None
+
+                    if slos.get(cand, Slo(None, None, None, None)).ok() and ramp_base_savings is not None and ramp_base_savings >= MIN_SAVINGS_PER_HOUR:
+                        good_windows += 1
+                        bad_windows = 0
+                    else:
+                        bad_windows += 1
+                        good_windows = 0
+
+                    step_elapsed_ok = (time.time() - step_since) >= RAMP_STEP_MIN_SECONDS
+
+                    if bad_windows >= REQUIRED_BAD_WINDOWS and cooldown_ok:
+                        # Phase 1B: start graceful drain instead of instant rollback
+                        bad_windows_snapshot = bad_windows
+                        drain_target = act
+                        drain_initial_weight_loser = float(w.get(cand, 0.0))
+                        drain_current_step = 0
+                        drain_step_since = time.time()
+                        phase = "draining"
+                        last_change = time.time()
+                        good_windows, bad_windows = 0, 0
+                        action, reason = f"rollback_drain_started_to_{act}", "candidate_unhealthy_or_no_savings"
+
+                        if ALERT_ON_BAD_WINDOWS:
+                            send_alert("bad_windows_sustained", "warning", {
+                                "bad_windows": bad_windows_snapshot,
+                                "threshold": REQUIRED_BAD_WINDOWS,
+                                "candidate": cand, "phase": "ramping",
+                            })
+                        if ALERT_ON_ROLLBACK:
+                            send_alert("rollback_triggered", "warning", {
+                                "rolled_back_to": act, "candidate_was": cand,
+                                "bad_windows": bad_windows_snapshot,
+                                "slo_candidate": {
+                                    "p95_ms": slos[cand].p95_ms if cand in slos else None,
+                                    "err": slos[cand].err if cand in slos else None,
+                                    "ok": slos[cand].ok() if cand in slos else False,
+                                },
+                            })
+
+                    elif step_elapsed_ok and good_windows >= REQUIRED_GOOD_WINDOWS and cooldown_ok:
+                        if step_index < len(RAMP_STEPS) - 1:
+                            step_index += 1
                             step_since = time.time()
                             good_windows, bad_windows = 0, 0
-                            phase = "ramping"
                             last_change = time.time()
 
                             step = RAMP_STEPS[step_index]
-                            wa, wb = (1.0 - step, step) if ramp_candidate == "b" else (step, 1.0 - step)
-                            set_weights(wa, wb)
-                            action, reason = f"start_ramp_{ramp_candidate}", "cost_opportunity"
+                            set_weights_dict(build_weights(full=act, partial=cand, step=step))
+                            action, reason = f"ramp_step_{step_index}_{cand}", "sustained_good_canary"
                         else:
-                            reason = "stay_steady"
-                    else:
-                        # ramping toward ramp_candidate
-                        cand = ramp_candidate
-                        act = other(cand)
-
-                        if slos[cand].ok() and savings_per_hour is not None and savings_per_hour >= MIN_SAVINGS_PER_HOUR:
-                            good_windows += 1
-                            bad_windows = 0
-                        else:
-                            bad_windows += 1
-                            good_windows = 0
-
-                        step_elapsed_ok = (time.time() - step_since) >= RAMP_STEP_MIN_SECONDS
-
-                        if bad_windows >= REQUIRED_BAD_WINDOWS and cooldown_ok:
-                            set_weights(1.0 if act == "a" else 0.0, 0.0 if act == "a" else 1.0)
                             phase, step_index = "steady", 0
                             good_windows, bad_windows = 0, 0
-                            last_change = time.time()
-                            action, reason = f"rollback_to_{act}", "candidate_unhealthy_or_no_savings"
-                        elif step_elapsed_ok and good_windows >= REQUIRED_GOOD_WINDOWS and cooldown_ok:
-                            if step_index < len(RAMP_STEPS) - 1:
-                                step_index += 1
-                                step_since = time.time()
-                                good_windows, bad_windows = 0, 0
-                                last_change = time.time()
+                            action, reason = f"promoted_{cand}", "ramp_complete"
+                    else:
+                        reason = "ramp_monitoring"
 
-                                step = RAMP_STEPS[step_index]
-                                wa, wb = (1.0 - step, step) if cand == "b" else (step, 1.0 - step)
-                                set_weights(wa, wb)
-                                action, reason = f"ramp_step_{step_index}_{cand}", "sustained_good_canary"
-                            else:
-                                phase, step_index = "steady", 0
-                                good_windows, bad_windows = 0, 0
-                                action, reason = f"promoted_{cand}", "ramp_complete"
-                        else:
-                            reason = "ramp_monitoring"
-
-            # update bot metrics
-            M_PHASE.set(0 if phase == "steady" else 1)
+            # Update Prometheus metrics
+            phase_val = {"steady": 0, "ramping": 1, "post_failover_hold": 2, "draining": 3}.get(phase, 0)
+            M_PHASE.set(phase_val)
             M_GOOD.set(good_windows)
             M_BAD.set(bad_windows)
             if action != "none":
                 M_ACTIONS.labels(action=action).inc()
 
-            # persist state
+            # Persist all state
             _set_state(con, "phase", phase)
             _set_state(con, "step_index", str(step_index))
             _set_state(con, "ramp_candidate", ramp_candidate)
@@ -348,43 +841,93 @@ def main():
             _set_state(con, "last_change", str(last_change))
             _set_state(con, "good_windows", str(good_windows))
             _set_state(con, "bad_windows", str(bad_windows))
+            _set_state(con, "last_failover_ts", str(last_failover_ts))
+            _set_state(con, "post_failover_confirm_windows", str(post_failover_confirm_windows))
+            _set_state(con, "failover_from", failover_from)
+            _set_state(con, "drain_target", drain_target)
+            _set_state(con, "drain_current_step", str(drain_current_step))
+            _set_state(con, "drain_step_since", str(drain_step_since))
+            _set_state(con, "drain_initial_weight_loser", str(drain_initial_weight_loser))
 
-            # audit log row
-            bytesps_a = bytes_per_s_primary("a")
-            bytesps_b = bytes_per_s_primary("b")
+            # Audit log (JSON-blob schema)
+            bytesps = {b: bytes_per_s_primary(b) for b in BNAMES}
             con.execute(
-                "INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     ts, phase, active, cand, step_index,
-                    w["a"], w["b"],
-                    compute["a"], compute["b"],
-                    egress["a"], egress["b"],
-                    slos["a"].p95_ms, slos["b"].p95_ms,
-                    slos["a"].err, slos["b"].err,
-                    slos["a"].cb_open, slos["b"].cb_open,
-                    slos["a"].rps_primary, slos["b"].rps_primary,
-                    bytesps_a, bytesps_b,
-                    action, reason
+                    json.dumps({b: w.get(b, 0.0) for b in BNAMES}),
+                    json.dumps({b: compute.get(b) for b in BNAMES}),
+                    json.dumps({b: egress.get(b) for b in BNAMES}),
+                    json.dumps({b: slos[b].p95_ms if b in slos else None for b in BNAMES}),
+                    json.dumps({b: slos[b].err if b in slos else None for b in BNAMES}),
+                    json.dumps({b: slos[b].cb_open if b in slos else None for b in BNAMES}),
+                    json.dumps({b: slos[b].rps_primary if b in slos else None for b in BNAMES}),
+                    json.dumps({b: bytesps.get(b) for b in BNAMES}),
+                    action, reason,
                 ),
             )
             con.commit()
+
+            # Phase 1D: update live state snapshot for Flask API
+            with _state_lock:
+                _live_state.update({
+                    "ts": ts,
+                    "phase": phase,
+                    "active": active,
+                    "candidate": cand,
+                    "step_index": step_index,
+                    "weights": dict(w),
+                    "good_windows": good_windows,
+                    "bad_windows": bad_windows,
+                    "last_change": last_change,
+                    "last_action": action,
+                    "last_reason": reason,
+                    "slo": {
+                        b: {
+                            "p95_ms": slos[b].p95_ms if b in slos else None,
+                            "err": slos[b].err if b in slos else None,
+                            "cb_open": slos[b].cb_open if b in slos else None,
+                            "rps": slos[b].rps_primary if b in slos else None,
+                            "ok": slos[b].ok() if b in slos else False,
+                        }
+                        for b in BNAMES
+                    },
+                    "cost_usd_per_hour": {b: total_cost.get(b) for b in BNAMES},
+                    "egress_usd_per_hour": {b: eg_costs.get(b) for b in BNAMES},
+                    "ramp_info": {
+                        "candidate": ramp_candidate,
+                        "step_index": step_index,
+                        "step_pct": RAMP_STEPS[step_index] if step_index < len(RAMP_STEPS) else 1.0,
+                        "steps": RAMP_STEPS,
+                    },
+                    "last_failover_ts": last_failover_ts,
+                    "post_failover_confirm_windows": post_failover_confirm_windows,
+                    "drain_info": {
+                        "target": drain_target,
+                        "current_step": drain_current_step,
+                        "total_steps": DRAIN_STEPS_COUNT,
+                        "initial_weight_loser": drain_initial_weight_loser,
+                    },
+                    "backends": BNAMES,
+                })
 
             print(json.dumps({
                 "ts": ts,
                 "phase": phase,
                 "weights": w,
-                "slo_ok": {"a": slos["a"].ok(), "b": slos["b"].ok()},
+                "slo_ok": {b: slos[b].ok() for b in slos},
                 "compute_usd_per_hour": compute,
                 "egress_usd_per_gb": egress,
                 "estimated_total_cost_usd_per_hour": total_cost,
                 "action": action,
-                "reason": reason
+                "reason": reason,
             }), flush=True)
 
         except Exception as e:
             print(json.dumps({"ts": ts, "error": str(e)}), flush=True)
 
         time.sleep(DECISION_INTERVAL)
+
 
 if __name__ == "__main__":
     main()

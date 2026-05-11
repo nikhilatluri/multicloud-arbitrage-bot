@@ -17,6 +17,12 @@ scrape_configs:
     static_configs:
       - targets: ["workload-b:8000"]
 
+  # Uncomment when running with --profile cloud-c
+  # - job_name: "workload-c"
+  #   metrics_path: /metrics
+  #   static_configs:
+  #     - targets: ["workload-c:8000"]
+
   - job_name: "pricefeed"
     metrics_path: /metrics
     static_configs:

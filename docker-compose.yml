@@ -21,16 +21,32 @@ services:
     ports:
       - "8002:8000"
 
-  router:
-    build: ./services/router
+  # Optional third backend — activate with: docker compose --profile cloud-c up
+  workload-c:
+    build: ./services/workload
+    profiles: ["cloud-c"]
     environment:
-      - TARGET_A_URL=http://workload-a:8000
-      - TARGET_B_URL=http://workload-b:8000
+      - CLOUD_ID=c
+      - BASE_LATENCY_MS=100
+      - JITTER_MS=35
+      - ERROR_RATE=0.008
+      - PAYLOAD_KB=48
+    ports:
+      - "8003:8000"
+
+  router:
+    build:
+      context: ./services
+      dockerfile: router/Dockerfile
+    environment:
+      - BACKENDS_CONFIG_PATH=/etc/arbitrage/backends.json
       - ROUTER_ADMIN_TOKEN=${ROUTER_ADMIN_TOKEN:-changeme}
       - CB_FAIL_THRESHOLD=5
       - CB_OPEN_SECONDS=20
       - SHADOW_PERCENT=0.05
       - STICKY_HEADER=X-Sticky-Key
+    volumes:
+      - ./backends.json:/etc/arbitrage/backends.json:ro
     ports:
       - "8080:8000"
     depends_on:
@@ -38,12 +54,13 @@ services:
       - workload-b
 
   pricefeed:
-    build: ./services/pricefeed
+    build:
+      context: ./services
+      dockerfile: pricefeed/Dockerfile
     environment:
-      - COMPUTE_A_USD_PER_HOUR=0.010
-      - COMPUTE_B_USD_PER_HOUR=0.008
-      - EGRESS_A_USD_PER_GB=0.090
-      - EGRESS_B_USD_PER_GB=0.085
+      - BACKENDS_CONFIG_PATH=/etc/arbitrage/backends.json
+    volumes:
+      - ./backends.json:/etc/arbitrage/backends.json:ro
     ports:
       - "7070:8000"
 
@@ -75,8 +92,11 @@ services:
       - prometheus
 
   bot:
-    build: ./services/bot
+    build:
+      context: ./services
+      dockerfile: bot/Dockerfile
     environment:
+      - BACKENDS_CONFIG_PATH=/etc/arbitrage/backends.json
       - PROM_URL=http://prometheus:9090
       - ROUTER_URL=http://router:8000
       - ROUTER_ADMIN_TOKEN=${ROUTER_ADMIN_TOKEN:-changeme}
@@ -101,10 +121,32 @@ services:
       - EG_COST_MODE=project_full_traffic
       - DB_PATH=/data/bot.db
       - BOT_METRICS_PORT=9101
+
+      # Phase 1A: post-failover hysteresis
+      - POST_FAILOVER_HOLD_SECONDS=300
+      - POST_FAILOVER_CONFIRM_WINDOWS=5
+
+      # Phase 1B: graceful drain
+      - DRAIN_STEPS=4
+      - DRAIN_STEP_SECONDS=10
+
+      # Phase 1C: alerts (set ALERT_WEBHOOK_URL to a Slack webhook or HTTP endpoint)
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
+      - ALERT_ON_FAILOVER=true
+      - ALERT_ON_ROLLBACK=true
+      - ALERT_ON_BAD_WINDOWS=true
+      - ALERT_COST_THRESHOLD_USD_PER_HOUR=${ALERT_COST_THRESHOLD_USD_PER_HOUR:-}
+      - BOT_INSTANCE_NAME=multicloud-bot
+
+      # Phase 1D: REST API
+      - BOT_API_PORT=9102
+      - BOT_API_TOKEN=${BOT_API_TOKEN:-}
     volumes:
       - botdata:/data
+      - ./backends.json:/etc/arbitrage/backends.json:ro
     ports:
       - "9101:9101"
+      - "9102:9102"
     depends_on:
       - router
       - pricefeed
