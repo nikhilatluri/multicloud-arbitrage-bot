@@ -21,15 +21,13 @@ services:
     ports:
       - "8002:8000"
 
-  # Optional third backend — activate with: docker compose --profile cloud-c up
   workload-c:
     build: ./services/workload
-    profiles: ["cloud-c"]
     environment:
       - CLOUD_ID=c
-      - BASE_LATENCY_MS=100
-      - JITTER_MS=35
-      - ERROR_RATE=0.008
+      - BASE_LATENCY_MS=60
+      - JITTER_MS=20
+      - ERROR_RATE=0.015
       - PAYLOAD_KB=48
     ports:
       - "8003:8000"
@@ -52,6 +50,7 @@ services:
     depends_on:
       - workload-a
       - workload-b
+      - workload-c
 
   pricefeed:
     build:
@@ -74,6 +73,7 @@ services:
       - router
       - workload-a
       - workload-b
+      - workload-c
       - pricefeed
       - bot
 

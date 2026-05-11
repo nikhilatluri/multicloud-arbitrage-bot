@@ -9,6 +9,11 @@
       "url": "http://localhost:8002",
       "compute_usd_per_hour": 0.008,
       "egress_usd_per_gb": 0.085
+    },
+    "c": {
+      "url": "http://localhost:8003",
+      "compute_usd_per_hour": 0.012,
+      "egress_usd_per_gb": 0.095
     }
   }
 }

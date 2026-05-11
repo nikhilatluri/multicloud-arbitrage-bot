@@ -41,6 +41,26 @@
       "console": "integratedTerminal",
       "justMyCode": false
     },
+    // ── workload-c ────────────────────────────────────────────────────────────
+    {
+      "name": "workload-c (:8003)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/.venv/bin/python3",
+      "module": "uvicorn",
+      "args": ["app:app", "--host", "0.0.0.0", "--port", "8003", "--reload"],
+      "cwd": "${workspaceFolder}/services/workload",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/services/shared",
+        "CLOUD_ID": "c",
+        "BASE_LATENCY_MS": "60",
+        "JITTER_MS": "20",
+        "ERROR_RATE": "0.015",
+        "PAYLOAD_KB": "48"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
     // ── pricefeed ─────────────────────────────────────────────────────────────
     {
       "name": "pricefeed (:7070)",
@@ -138,6 +158,7 @@
       "configurations": [
         "workload-a (:8001)",
         "workload-b (:8002)",
+        "workload-c (:8003)",
         "pricefeed (:7070)",
         "router (:8080)",
         "bot (metrics :9101, API :9102)"

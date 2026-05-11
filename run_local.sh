@@ -51,7 +51,7 @@ if [[ -f "$PID_FILE" ]]; then
   while IFS= read -r pid; do kill "$pid" 2>/dev/null || true; done < "$PID_FILE"
   rm -f "$PID_FILE"
 fi
-for _port in 8001 8002 7070 8080 9101 9102; do
+for _port in 8001 8002 8003 7070 8080 9101 9102; do
   _pid=$(lsof -ti tcp:"$_port" 2>/dev/null || true)
   [[ -n "$_pid" ]] && kill "$_pid" 2>/dev/null && echo "  freed port $_port (pid $_pid)" || true
 done
@@ -107,6 +107,11 @@ wait_for_port workload-a 8001
 start_uvicorn workload app:app 8002 \
   "CLOUD_ID=b" "BASE_LATENCY_MS=120" "JITTER_MS=40" "ERROR_RATE=0.005" "PAYLOAD_KB=64"
 wait_for_port workload-b 8002
+
+# ── workload-c ────────────────────────────────────────────────────────────────
+start_uvicorn workload app:app 8003 \
+  "CLOUD_ID=c" "BASE_LATENCY_MS=60" "JITTER_MS=20" "ERROR_RATE=0.015" "PAYLOAD_KB=48"
+wait_for_port workload-c 8003
 
 # ── pricefeed ─────────────────────────────────────────────────────────────────
 echo "Starting pricefeed on :7070 ..."
@@ -252,6 +257,7 @@ echo
 echo "=== All services up ==="
 echo "  workload-a      http://localhost:8001/health"
 echo "  workload-b      http://localhost:8002/health"
+echo "  workload-c      http://localhost:8003/health"
 echo "  router          http://localhost:8080/target"
 echo "  pricefeed       http://localhost:7070/price"
 echo "  bot metrics     http://localhost:9101/metrics"
