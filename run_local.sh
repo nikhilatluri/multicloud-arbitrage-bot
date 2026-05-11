@@ -22,7 +22,12 @@ BACKENDS_CONFIG="$REPO/backends.local.json"
 LOGS_DIR="$REPO/.local_logs"
 PID_FILE="$REPO/.local_pids"
 
-PYTHON="${PYTHON:-python3}"
+# Prefer the project venv so all dependencies are guaranteed available
+if [[ -x "$REPO/.venv/bin/python3" ]]; then
+  PYTHON="${PYTHON:-$REPO/.venv/bin/python3}"
+else
+  PYTHON="${PYTHON:-python3}"
+fi
 
 # ── stop ────────────────────────────────────────────────────────────────────
 if [[ "${1:-}" == "stop" ]]; then

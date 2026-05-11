@@ -6,6 +6,7 @@
       "name": "workload-a (:8001)",
       "type": "debugpy",
       "request": "launch",
+      "python": "${workspaceFolder}/.venv/bin/python3",
       "module": "uvicorn",
       "args": ["app:app", "--host", "0.0.0.0", "--port", "8001", "--reload"],
       "cwd": "${workspaceFolder}/services/workload",
@@ -25,6 +26,7 @@
       "name": "workload-b (:8002)",
       "type": "debugpy",
       "request": "launch",
+      "python": "${workspaceFolder}/.venv/bin/python3",
       "module": "uvicorn",
       "args": ["app:app", "--host", "0.0.0.0", "--port", "8002", "--reload"],
       "cwd": "${workspaceFolder}/services/workload",
@@ -44,6 +46,7 @@
       "name": "pricefeed (:7070)",
       "type": "debugpy",
       "request": "launch",
+      "python": "${workspaceFolder}/.venv/bin/python3",
       "module": "uvicorn",
       "args": ["app:app", "--host", "0.0.0.0", "--port", "7070", "--reload"],
       "cwd": "${workspaceFolder}/services/pricefeed",
@@ -59,6 +62,7 @@
       "name": "router (:8080)",
       "type": "debugpy",
       "request": "launch",
+      "python": "${workspaceFolder}/.venv/bin/python3",
       "module": "uvicorn",
       "args": ["app:app", "--host", "0.0.0.0", "--port", "8080", "--reload"],
       "cwd": "${workspaceFolder}/services/router",
@@ -79,6 +83,7 @@
       "name": "bot (metrics :9101, API :9102)",
       "type": "debugpy",
       "request": "launch",
+      "python": "${workspaceFolder}/.venv/bin/python3",
       "program": "${workspaceFolder}/services/bot/bot.py",
       "cwd": "${workspaceFolder}/services/bot",
       "env": {
@@ -93,7 +98,7 @@
         "WINDOW": "2m",
         "MAX_P95_MS": "200",
         "MAX_ERROR_RATE": "0.02",
-        "MIN_TOTAL_RPS": "2",
+        "MIN_TOTAL_RPS": "0.5",
         "MIN_SAVINGS_PER_HOUR": "0.001",
         "SWITCHING_PENALTY_USD": "0.0002",
         "RAMP_STEPS": "0.10,0.25,0.50,1.00",
@@ -118,9 +123,9 @@
       "console": "integratedTerminal",
       "justMyCode": false
     },
-    // ── full stack (compound) ─────────────────────────────────────────────────
+    // ── full stack via shell script ────────────────────────────────────────────
     {
-      "name": "Full Stack",
+      "name": "Full Stack (run_local.sh)",
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/run_local.sh",
