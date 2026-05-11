@@ -283,13 +283,45 @@ def rps_shadow(backend: str) -> Optional[float]:
     return prom_query(q)
 
 
+def p95_ms_shadow(backend: str) -> Optional[float]:
+    q = (
+        f'histogram_quantile(0.95, '
+        f'sum(rate(router_backend_latency_seconds_bucket{{backend="{backend}",kind="shadow"}}[{WINDOW}])) by (le)'
+        f')'
+    )
+    v = prom_query(q)
+    return None if v is None else v * 1000.0
+
+
+def err_rate_shadow(backend: str) -> Optional[float]:
+    total_q = f'sum(rate(router_backend_requests_total{{backend="{backend}",kind="shadow"}}[{WINDOW}]))'
+    total = prom_query(total_q)
+    if total is None or total == 0:
+        return None
+    err_q = f'sum(rate(router_backend_requests_total{{backend="{backend}",kind="shadow",code_class="5xx"}}[{WINDOW}]))'
+    err = prom_query(err_q)
+    return 0.0 if err is None else err / total
+
+
 def cb_open(backend: str) -> Optional[float]:
     q = f'max(router_circuit_open{{backend="{backend}"}})'
     return prom_query(q)
 
 
 def get_slos() -> Dict[str, Slo]:
-    return {b: Slo(p95_ms(b), err_rate(b), cb_open(b), rps_primary(b)) for b in BNAMES}
+    slos = {}
+    for b in BNAMES:
+        p95 = p95_ms(b)
+        err = err_rate(b)
+        rps = rps_primary(b)
+        # Candidate has no primary traffic yet — fall back to shadow metrics
+        if (p95 is None or err is None) and (rps is None or rps == 0):
+            shadow_rps = rps_shadow(b)
+            if shadow_rps is not None and shadow_rps > 0:
+                p95 = p95 if p95 is not None else p95_ms_shadow(b)
+                err = err if err is not None else err_rate_shadow(b)
+        slos[b] = Slo(p95, err, cb_open(b), rps)
+    return slos
 
 
 def get_prices() -> Tuple[Dict[str, float], Dict[str, float]]:
