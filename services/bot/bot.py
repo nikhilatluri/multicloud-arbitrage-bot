@@ -1,5 +1,7 @@
 import os
+import signal
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -1150,9 +1152,29 @@ def _run_flask() -> None:
 # Main decision loop
 # ---------------------------------------------------------------------------
 
+def _free_port(port: int) -> None:
+    """Kill any process holding port so re-launching from VS Code never blocks."""
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f"tcp:{port}"],
+            capture_output=True, text=True, timeout=3,
+        )
+        for pid_str in result.stdout.strip().split():
+            try:
+                os.kill(int(pid_str), signal.SIGTERM)
+            except (ProcessLookupError, ValueError):
+                pass
+        if result.stdout.strip():
+            time.sleep(0.4)  # give OS time to release the socket
+    except Exception:
+        pass
+
+
 def main():
     global _force_override, _last_cost_alert_ts
 
+    _free_port(BOT_METRICS_PORT)
+    _free_port(BOT_API_PORT)
     start_http_server(BOT_METRICS_PORT)
     threading.Thread(target=_run_flask, daemon=True).start()
 
