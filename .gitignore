@@ -82,6 +82,7 @@ desktop.ini
 !.vscode/launch.json
 !.vscode/settings.json
 !.vscode/extensions.json
+!.vscode/tasks.json
 
 # ── Test / coverage artefacts ─────────────────────────────────────────────────
 .pytest_cache/

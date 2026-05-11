@@ -1,0 +1,41 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Stop All Services",
+      "type": "shell",
+      "command": "${workspaceFolder}/run_local.sh stop",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "focus": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Start All Services",
+      "type": "shell",
+      "command": "${workspaceFolder}/run_local.sh",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true
+      },
+      "problemMatcher": [],
+      "isBackground": true,
+      "runOptions": {
+        "instanceLimit": 1
+      }
+    },
+    {
+      "label": "Kill Ports (force-free 8001 8002 7070 8080 9101 9102)",
+      "type": "shell",
+      "command": "for p in 8001 8002 7070 8080 9101 9102 3000; do pid=$(lsof -ti tcp:$p 2>/dev/null); [ -n \"$pid\" ] && kill $pid && echo \"freed :$p\" || true; done; echo done",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

@@ -45,6 +45,17 @@ if [[ "${1:-}" == "stop" ]]; then
 fi
 
 # ── start ────────────────────────────────────────────────────────────────────
+# Kill any stale processes from a previous run (ports 8001 8002 7070 8080 9101 9102)
+if [[ -f "$PID_FILE" ]]; then
+  echo "Cleaning up stale processes from previous run..."
+  while IFS= read -r pid; do kill "$pid" 2>/dev/null || true; done < "$PID_FILE"
+  rm -f "$PID_FILE"
+fi
+for _port in 8001 8002 7070 8080 9101 9102; do
+  _pid=$(lsof -ti tcp:"$_port" 2>/dev/null || true)
+  [[ -n "$_pid" ]] && kill "$_pid" 2>/dev/null && echo "  freed port $_port (pid $_pid)" || true
+done
+
 mkdir -p "$LOGS_DIR"
 > "$PID_FILE"
 # Truncate logs so each run starts clean (no stale errors from old runs)
